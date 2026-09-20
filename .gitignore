@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+
+# uv
+uv.lock.tmp
+
+# Config (secrets/db dsn)
+config/config.toml
+
+# Tooling
+node_modules/
+
+# Runtime data
+data/
+thumbnails/
+*.db

@@ -1,0 +1,29 @@
+# image-library configuration.
+# Copy to config/config.toml and adjust.
+
+[app]
+window_width = 1280
+window_height = 800
+
+[db]
+# SQLAlchemy URL for the Postgres+pgvector catalog.
+dsn = "postgresql+psycopg://imagelib:imagelib@localhost:5432/imagelib"
+
+[scan]
+# Directories to watch. ~ is expanded on load.
+watched_dirs = ["~/Pictures"]
+# Content hash will still be required to detect changes.
+scan_interval_seconds = 300
+thumbnail_dir = "data/thumbnails"
+
+[analysis]
+# deepface detector name: retinaface, mtcnn, opencv, ssd, mediapipe, dlib
+detector_backend = "retinaface"
+# deepface model for embeddings: Facenet, VGG-Face, ArcFace, OpenFace, DeepFace, Dlib, SFace, GhostFaceNet
+# Facenet (512-dim) chosen so embeddings fit pgvector's 2000-dim HNSW index limit.
+recognizer_backend = "Facenet"
+# Min cosine threshold used to confirm identification/similarity.
+similarity_threshold = 0.6
+# DBSCAN eps for grouping embeddings into persons.
+cluster_eps = 0.6
+cluster_min_samples = 2

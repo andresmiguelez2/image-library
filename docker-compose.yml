@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: imagelib-db
+    environment:
+      POSTGRES_DB: imagelib
+      POSTGRES_USER: imagelib
+      POSTGRES_PASSWORD: imagelib
+    ports:
+      - "5432:5432"
+    volumes:
+      - imagelib-data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U imagelib -d imagelib"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  imagelib-data:

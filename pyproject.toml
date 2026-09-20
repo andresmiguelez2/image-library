@@ -1,0 +1,36 @@
+[project]
+name = "image-library"
+version = "0.1.0"
+description = "Local image library: index, analyze faces, filter by face/location/date."
+readme = "README.md"
+requires-python = ">=3.10,<3.11"
+license = { file = "LICENSE" }
+dependencies = [
+    "PySide6>=6.6",
+    "sqlalchemy>=2.0",
+    "psycopg[binary]>=3.1",
+    "pgvector>=0.2",
+    "pillow>=10.0",
+    "exifread>=3.0",
+    "scikit-learn>=1.3",
+    "deepface>=0.0.80",
+    "tqdm>=4.66",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+imagelib-scan = "imagelib.scripts.scan_cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/imagelib"]
+
+[tool.uv]
+package = true
