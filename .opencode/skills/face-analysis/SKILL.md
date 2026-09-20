@@ -6,12 +6,12 @@ description: Use when implementing or debugging face detection/embedding with de
 # DeepFace pipeline
 
 Two stages, gated by the `images.status` column (`pending` → `indexed` →
-`analyzed`/`error`) and the `content_hash` uniqueness check.
+`analysed`/`error`) and the `content_hash` uniqueness check.
 
-## Stage 2 (analyze)
+## Stage 2 (analyse)
 
 Per image: detect faces → embed each → store `faces` rows → cluster into
-`persons` → `status='analyzed'`.
+`persons` → `status='analysed'`.
 
 ```python
 from deepface import DeepFace

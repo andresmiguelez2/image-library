@@ -10,7 +10,7 @@ never reprocessed.
 Three layers:
 
 - **UI** (`src/imagelib/ui/`, PySide6): thumbnail grid + filter panel + detail/face browsers. Must never block; heavy work happens in worker threads.
-- **Services** (`src/imagelib/services/`): `scanner.py` (stage-1 ingest), `catalog.py` (queries), analyzer/clustering (future).
+- **Services** (`src/imagelib/services/`): `scanner.py` (stage-1 ingest), `catalog.py` (queries), analyser/clustering (future).
 - **Storage**: Postgres with `vector` extension (schema in `scripts/init_db.sql`, ORM in `src/imagelib/db/models.py`), original images stay on disk, thumbnails cached under `data/thumbnails`.
 
 ## The incremental pipeline (critical design rule)
@@ -18,7 +18,7 @@ Three layers:
 Two stages; the DB `status` column drives skip-reprocessing:
 
 1. **Ingest** (fast): walk `watched_dirs` → sha256 `content_hash` → skip unchanged → extract EXIF/GPS (`exifread`/`pillow`) → thumbnail → `status='indexed'`, visible immediately.
-2. **Analyze** (slow, async): deepface detection + embeddings → `status='analyzed'`; DBSCAN clusters embeddings into `persons`.
+2. **Analyse** (slow, async): deepface detection + embeddings → `status='analysed'`; DBSCAN clusters embeddings into `persons`.
 
 Never reprocess an image whose `content_hash` is unchanged. Never modify original files.
 
@@ -30,7 +30,7 @@ The model is loaded once and reused; loading it per image is seconds each time.
 
 - Install/sync deps: `uv sync --all-groups` (Python 3.10 via `uv`; venv in `.venv`, lockfile `uv.lock`).
 - Run a script: `uv run <script>` or `uv run python -m help`.
-- Postgres (containerized, `pgvector/pgvector:pg16`): `docker compose up -d`, wait for healthy, DSN `postgresql+psycopg://imagelib:imagelib@localhost:5432/imagelib`.
+- Postgres (containerised, `pgvector/pgvector:pg16`): `docker compose up -d`, wait for healthy, DSN `postgresql+psycopg://imagelib:imagelib@localhost:5432/imagelib`.
   - First boot auto-applies `scripts/init_db.sql` (creates `vector` ext + HNSW index). To re-apply: `docker compose down -v && docker compose up -d`.
 - Headless ingest CLI: `uv run imagelib-scan` (stub until scanner is wired).
 - Tests: `uv run pytest -q`.
@@ -48,3 +48,19 @@ Shorthand commands are also available as opencode slash commands: `/sync`, `/db-
 - SQLAlchemy 2.x typed ORM style (`Mapped[...]`, `mapped_column`), matching `scripts/init_db.sql` exactly — keep both in sync when changing schema.
 - Config read only through `imagelib.config.config` (module-level dict).
 - Do not add code comments unless asked.
+- Use British English.
+- Git commits:
+  - Try to keep content simple (better two simple commits than a big one).
+  - Use conventional commits for the message.
+  - Use the agent name as the author
+
+## General guidelines
+
+- Ask instead of assume.
+- Flag uncertainty before acting.
+- Keep me in the loop before irreversible steps.
+- Be concise and to the point.
+
+## About me
+
+I am an engineer exeperinced in Python and SQL, but not so much in other technologies. I am eager to learn new things, although I might need a more detailed explanation about these.

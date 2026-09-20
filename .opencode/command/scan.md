@@ -1,6 +1,6 @@
 ---
 description: Run the headless ingest pipeline and summarize results.
-agent: image-analyzer
+agent: image-analyser
 ---
 
 Run stage-1 ingest:

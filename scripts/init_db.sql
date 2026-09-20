@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS images (
     thumb_path    TEXT,
     face_count    INTEGER NOT NULL DEFAULT 0,
     status        TEXT NOT NULL DEFAULT 'pending'
-                  CHECK (status IN ('pending', 'indexed', 'analyzed', 'error')),
+                  CHECK (status IN ('pending', 'indexed', 'analysed', 'error')),
     error         TEXT,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()

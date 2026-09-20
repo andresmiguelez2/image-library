@@ -8,7 +8,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from imagelib.config import config
 
-IMAGE_STATUSES = ("pending", "indexed", "analyzed", "error")
+IMAGE_STATUSES = ("pending", "indexed", "analysed", "error")
 
 
 class Base(DeclarativeBase):
@@ -47,7 +47,7 @@ class Image(Base):
 
     __tablename__ = "images"
     __table_args__ = (
-        CheckConstraint("status IN ('pending','indexed','analyzed','error')", name="ck_images_status"),
+        CheckConstraint("status IN ('pending','indexed','analysed','error')", name="ck_images_status"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)

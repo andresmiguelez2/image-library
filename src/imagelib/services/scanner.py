@@ -3,7 +3,7 @@
 Stage 1 (this module): walk watched dirs, hash files, extract EXIF/GPS metadata,
 generate thumbnails, and flip unchanged images to ''indexed'' so the UI can show
 them immediately.
-Stage 2 (analyzer, future): deepface detection/embeddings -> ''analyzed''.
+Stage 2 (analyser, future): deepface detection/embeddings -> ''analysed''.
 
 Incremental rule: an image whose content_hash is unchanged is skipped entirely
 (the DB status column is what prevents reprocessing).

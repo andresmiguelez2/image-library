@@ -45,9 +45,6 @@ user — it destroys the whole catalog.
 
 ## Gotchas
 
-- **WSL2 integration**: if `docker` says the command can't be found in this
-  distro, the user must enable Docker Desktop → Settings → Resources → WSL
-  integration. Nothing else will fix it.
 - **Port 5432 conflicts**: an existing local Postgres binds it; change the port
   mapping in `docker-compose.yml` and the DSN together.
 - **Vector dimensions**: pgvector's HNSW/IVFFlat indexes cap at 2000 dims.
