@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "skills": {
+    "pyqt6-ui-development-rules": {
+      "source": "oimiragieo/agent-studio",
+      "sourceType": "github",
+      "skillPath": ".claude/skills/pyqt6-ui-development-rules/SKILL.md",
+      "computedHash": "7d67c0d5cad20f9631cf6fe659cc6fbadee7dfb6a19f19dbe82a6c283a71d4fb"
+    },
+    "python-testing-patterns": {
+      "source": "wshobson/agents",
+      "sourceType": "github",
+      "skillPath": "plugins/python-development/skills/python-testing-patterns/SKILL.md",
+      "computedHash": "1306eea409e7eff2288d7658806cb508f18339a0ee9a686d324a0fd2570eae55"
+    }
+  }
+}
