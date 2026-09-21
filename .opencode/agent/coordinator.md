@@ -10,8 +10,8 @@ permission:
     "*": ask
     "git *": allow
     "gh *": allow
-    "git commit": deny
-    "git push": deny
+    "git commit *": deny
+    "git push *": deny
     "uv *": allow
     "mkdir *": allow
     "rm *": allow

@@ -7,7 +7,7 @@ permission:
   bash:
     "*": ask
     "git *": allow
-    "git push*": deny
+    "git push *": deny
 ---
 
 # Role
