@@ -9,8 +9,8 @@ permission:
     "*": "ask"
     "psql *": "allow"
     "docker *": "allow"
-    "git push*": deny
     "git *": allow
+    "git push*": deny
 ---
 
 # Role

@@ -5,6 +5,7 @@ Usage:
 """
 
 import argparse
+from tqdm import tqdm
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -16,10 +17,22 @@ def main(argv: list[str] | None = None) -> int:
     if args.scan:
         from imagelib.services.scanner import scan_watched_dirs
 
-        scan_watched_dirs()
+        report = scan_watched_dirs(progress=lambda path: None)
+        print(
+            f"scan: discovered={report.discovered} indexed={report.indexed} "
+            f"unchanged={report.unchanged} errors={report.errors}"
+        )
         return 0
     if args.analyse:
-        raise NotImplementedError("Stage-2 analyser lands in a later pass.")
+        from imagelib.services.analyser import analyse_images
+
+        with tqdm(desc="analysis", unit="image") as bar:
+            report = analyse_images(progress=lambda image: bar.update(1))
+        print(
+            f"analysis: discovered={report.discovered} analysed={report.analysed} "
+            f"faces={report.faces} errors={report.errors}"
+        )
+        return 0 if report.errors == 0 else 1
     parser.print_help()
     return 0
 

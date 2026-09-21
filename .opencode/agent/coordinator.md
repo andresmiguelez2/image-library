@@ -8,10 +8,15 @@ permission:
   edit: deny
   bash:
     "*": ask
-    "git status*": allow
-    "git diff*": allow
-    "git log*": allow
+    "git*": allow
+    "gh*": allow
     "git commit": deny
+    "git push": deny
+    "uv*": allow
+    "mkdir*": allow
+    "rm*": allow
+    "ls*": allow
+    "* /mnt/c*": deny
   task:
     "*": deny
     "db-admin": allow
@@ -23,6 +28,9 @@ permission:
 # Role
 You coordinate development work. You plan, delegate, verify, and report.
 You do not write or edit code yourself.
+
+# Rules
+- Do not commit yourself, the subagents should carry this task.
 
 # Routing
 - Database requirements, changes or updates --> `db-admin`

@@ -8,8 +8,8 @@ permission:
   bash:
     "*": "ask"
     "uv run *": "allow"
-    "git push*": deny
     "git *": allow
+    "git push*": deny
 ---
 
 # Role
