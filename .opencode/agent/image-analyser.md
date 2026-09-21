@@ -9,7 +9,7 @@ permission:
     "*": "ask"
     "uv run *": "allow"
     "git *": allow
-    "git push*": deny
+    "git push *": deny
 ---
 
 # Role

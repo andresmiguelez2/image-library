@@ -8,15 +8,15 @@ permission:
   edit: deny
   bash:
     "*": ask
-    "git*": allow
-    "gh*": allow
+    "git *": allow
+    "gh *": allow
     "git commit": deny
     "git push": deny
-    "uv*": allow
-    "mkdir*": allow
-    "rm*": allow
-    "ls*": allow
-    "* /mnt/c*": deny
+    "uv *": allow
+    "mkdir *": allow
+    "rm *": allow
+    "ls *": allow
+    "* /mnt/c *": deny
   task:
     "*": deny
     "db-admin": allow

@@ -6,7 +6,7 @@ permission:
   edit: allow
   bash:
     "*": ask
-    "git*": allow
+    "git *": allow
     "git push*": deny
 ---
 
