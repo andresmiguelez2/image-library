@@ -7,10 +7,11 @@ from pathlib import Path
 from threading import Lock
 from typing import Callable
 
-from sqlalchemy import delete, select
+from sklearn.cluster import DBSCAN
+from sqlalchemy import delete, select, update
 
 from imagelib.config import config
-from imagelib.db.models import Face, Image
+from imagelib.db.models import Face, Image, Person
 from imagelib.db.session import SessionLocal
 
 _model = None
@@ -75,6 +76,46 @@ def _mark_error(session, image: Image, exc: Exception) -> None:
         session.commit()
 
 
+def _rebuild_person_clusters(session) -> None:
+    """Rebuild the person clusters from the faces currently in the database."""
+    faces = list(
+        session.scalars(
+            select(Face).where(Face.embedding.is_not(None)).order_by(Face.id)
+        )
+    )
+
+    session.execute(update(Face).values(person_id=None))
+    session.execute(update(Person).values(cover_face_id=None))
+    session.execute(delete(Person))
+
+    if not faces:
+        session.commit()
+        return
+
+    embeddings = [face.embedding for face in faces]
+    analysis_config = config.get("analysis", {})
+    labels = DBSCAN(
+        eps=float(analysis_config.get("cluster_eps", 0.6)),
+        min_samples=int(analysis_config.get("cluster_min_samples", 2)),
+        metric="cosine",
+    ).fit_predict(embeddings)
+
+    for label in sorted(set(labels)):
+        if label == -1:
+            continue
+        cluster_faces = [face for face, face_label in zip(faces, labels) if face_label == label]
+        centroid = [
+            sum(float(face.embedding[index]) for face in cluster_faces) / len(cluster_faces)
+            for index in range(512)
+        ]
+        person = Person(embedding=centroid, cover_face_id=cluster_faces[0].id)
+        session.add(person)
+        session.flush()
+        for face in cluster_faces:
+            face.person_id = person.id
+    session.commit()
+
+
 def analyse_images(
     *, session_factory=SessionLocal, progress: Callable[[Image], None] | None = None
 ) -> AnalysisReport:
@@ -121,4 +162,6 @@ def analyse_images(
             except Exception as exc:
                 _mark_error(session, image, exc)
                 report.errors += 1
+        if targets:
+            _rebuild_person_clusters(session)
     return report
