@@ -3,7 +3,7 @@
 from datetime import datetime
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import CheckConstraint, DateTime, Float, ForeignKey, Integer, String, Table, Text
+from sqlalchemy import BigInteger, CheckConstraint, DateTime, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from imagelib.config import config
@@ -39,7 +39,9 @@ class Person(Base):
     embedding: Mapped[list[float] | None] = mapped_column(Vector(512), nullable=True)
     cover_face_id: Mapped[int | None] = mapped_column(ForeignKey("faces.id"), nullable=True)
 
-    faces: Mapped[list["Face"]] = relationship(back_populates="person")
+    faces: Mapped[list["Face"]] = relationship(
+        back_populates="person", foreign_keys="Face.person_id"
+    )
 
 
 class Image(Base):
@@ -54,7 +56,7 @@ class Image(Base):
     source_id: Mapped[int] = mapped_column(ForeignKey("sources.id", ondelete="CASCADE"))
     path: Mapped[str] = mapped_column(String, unique=True)
     content_hash: Mapped[str] = mapped_column(String)
-    size_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     width: Mapped[int | None] = mapped_column(Integer, nullable=True)
     height: Mapped[int | None] = mapped_column(Integer, nullable=True)
     taken_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -91,7 +93,9 @@ class Face(Base):
     confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     image: Mapped[Image] = relationship(back_populates="faces")
-    person: Mapped[Person | None] = relationship(back_populates="faces")
+    person: Mapped[Person | None] = relationship(
+        back_populates="faces", foreign_keys=[person_id]
+    )
 
 
 def database_url() -> str:

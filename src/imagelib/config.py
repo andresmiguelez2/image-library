@@ -23,3 +23,12 @@ def load_config(path: Path | None = None) -> dict[str, Any]:
 
 
 config = load_config()
+
+
+def watched_directories() -> list[Path]:
+    return [Path(value).expanduser().resolve() for value in config["scan"]["watched_dirs"]]
+
+
+def thumbnail_directory() -> Path:
+    value = Path(config["scan"]["thumbnail_dir"]).expanduser()
+    return (value if value.is_absolute() else PROJECT_ROOT / value).resolve()
