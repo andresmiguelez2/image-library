@@ -26,7 +26,19 @@ config = load_config()
 
 
 def watched_directories() -> list[Path]:
-    return [Path(value).expanduser().resolve() for value in config["scan"]["watched_dirs"]]
+    values = config.get("scan", {}).get("watched_dirs") or ["~/Data/images"]
+    return [Path(value).expanduser().resolve() for value in values]
+
+
+def active_root(root: str | Path | None = None) -> Path:
+    """Return the selected scan root, without requiring it to be configured."""
+    if root is not None:
+        return Path(root).expanduser().resolve()
+    value = config.get("scan", {}).get("active_root")
+    if value:
+        return Path(value).expanduser().resolve()
+    directories = watched_directories()
+    return directories[0] if directories else Path("~/Data/images").expanduser().resolve()
 
 
 def thumbnail_directory() -> Path:
