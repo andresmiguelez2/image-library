@@ -9,7 +9,6 @@ permission:
     "git status*": allow
     "git diff*": allow
     "git log*": allow
-    "git status*": allow
     "ls*": allow
     "rg*": allow
     "cat*": allow

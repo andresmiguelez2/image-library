@@ -17,6 +17,7 @@ permission:
     "echo *": allow
     "rm *": allow
     "ls *": allow
+    "cat *": allow
     "* /mnt/c *": deny
   task:
     "*": deny
