@@ -10,6 +10,7 @@ permission:
     "*": ask
     "git *": allow
     "gh *": allow
+    "docker *": allow
     "git commit *": deny
     "git push *": deny
     "uv *": allow
