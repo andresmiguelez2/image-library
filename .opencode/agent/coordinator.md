@@ -7,17 +7,7 @@ effort: high
 permission:
   edit: deny
   bash:
-    "*": ask
-    "git *": allow
-    "git push *": deny
-    "gh *": allow
-    "uv *": allow
-    "mkdir *": allow
-    "print*": allow
-    "echo *": allow
-    "rm *": allow
-    "ls *": allow
-    "cat *": allow
+    "*": allow
     "* /mnt/c *": deny
   task:
     "*": deny
