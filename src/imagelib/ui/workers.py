@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from pathlib import Path
 from threading import Event
 
 from PySide6.QtCore import QObject, QRunnable, QRect, Signal
 from PySide6.QtGui import QImage
+
+
+logger = logging.getLogger(__name__)
 
 
 class TaskSignals(QObject):
@@ -27,6 +31,7 @@ class FunctionTask(QRunnable):
         try:
             self.signals.result.emit(self.function())
         except Exception as exc:
+            logger.exception("UI background task failed (%s)", getattr(self.function, "__name__", "callable"))
             self.signals.error.emit(f"{type(exc).__name__}: {exc}")
         finally:
             self.signals.finished.emit()
@@ -46,7 +51,8 @@ class RootValidationTask(QRunnable):
 
                 valid = os.access(self.root, os.R_OK | os.X_OK)
             self.signals.result.emit((self.root, bool(valid)))
-        except OSError:
+        except OSError as exc:
+            logger.exception("Could not validate image root %s", self.root)
             self.signals.result.emit((self.root, False))
 
 
@@ -68,6 +74,7 @@ class ScanTask(QRunnable):
             )
             self.signals.result.emit(("complete", report))
         except Exception as exc:
+            logger.exception("Image scan failed for %s", self.root)
             self.signals.error.emit(f"{type(exc).__name__}: {exc}")
         finally:
             self.signals.finished.emit()
@@ -101,6 +108,7 @@ class ImageAssetTask(QRunnable):
                     crops.append(image.copy(rectangle) if not rectangle.isEmpty() else QImage())
             self.signals.result.emit(ImageAsset(image, tuple(crops)))
         except Exception as exc:
+            logger.exception("Could not load image asset %s", self.path)
             self.signals.error.emit(f"{type(exc).__name__}: {exc}")
         finally:
             self.signals.finished.emit()

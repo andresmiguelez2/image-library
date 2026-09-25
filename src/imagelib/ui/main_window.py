@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sys
 from pathlib import Path
 from threading import Event
@@ -43,6 +44,9 @@ from imagelib.config import config
 from imagelib.services import analyser, catalog
 from imagelib.ui.models import CalendarDelegate, CalendarModel, ThumbnailDelegate, ThumbnailModel
 from imagelib.ui.workers import FunctionTask, ImageAsset, ImageAssetTask, RootValidationTask, ScanTask
+
+
+logger = logging.getLogger(__name__)
 
 
 def _default_root() -> Path:
@@ -134,15 +138,20 @@ class DetailPanel(QFrame):
         self.image = FaceImageWidget()
         self.face_scroll = QScrollArea()
         self.face_scroll.setWidgetResizable(True)
+        self.face_scroll.setMinimumHeight(152)
+        self.face_scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.face_strip = QWidget()
         self.face_layout = QHBoxLayout(self.face_strip)
+        self.face_layout.setContentsMargins(6, 6, 6, 6)
         self.face_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        self.face_strip.setMinimumHeight(140)
+        self.face_strip.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
         self.face_scroll.setWidget(self.face_strip)
         layout = QVBoxLayout(self)
         layout.addWidget(self.title)
         layout.addWidget(self.image, 1)
         layout.addWidget(self.face_scroll)
-        self.setMinimumHeight(280)
+        self.setMinimumHeight(380)
 
     def clear(self, message: str = "Select an image to see details") -> None:
         self._serial += 1
@@ -182,7 +191,10 @@ class DetailPanel(QFrame):
         self.image.set_asset(pixmap, self._faces)
         for face, crop in zip(self._faces, asset.crops):
             card = QWidget()
+            card.setMinimumWidth(120)
+            card.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
             card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(6, 6, 6, 6)
             preview = QLabel()
             preview.setFixedSize(96, 96)
             preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -201,6 +213,7 @@ class DetailPanel(QFrame):
 
     def _asset_error(self, serial: int, message: str) -> None:
         if serial == self._serial:
+            logger.error("Could not load detail image: %s", message)
             self.image.set_asset(QPixmap())
             self.title.setText(f"Could not load image: {message}")
 
@@ -295,6 +308,7 @@ class AnalysisCoordinator(QObject):
         self.process.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
         self.process.started.connect(self._process_started)
         self.process.readyReadStandardOutput.connect(self._read_output)
+        self.process.readyReadStandardError.connect(self._read_error_output)
         self.process.errorOccurred.connect(self._process_error)
         self.process.finished.connect(self._process_finished)
         self._generation = 0
@@ -352,6 +366,7 @@ class AnalysisCoordinator(QObject):
 
     def _selection_error(self, generation: int, message: str) -> None:
         if self._active and generation == self._generation:
+            logger.error("Analysis target selection failed for %s: %s", self._root, message)
             self._active = False
             self.failed.emit(f"Could not select analysis targets: {message}")
 
@@ -407,9 +422,15 @@ class AnalysisCoordinator(QObject):
                 self.status.emit(f"Analysing {len(self._responses)} of {len(self._targets)}…")
                 self._send_next(self._generation)
             except (UnicodeDecodeError, json.JSONDecodeError, AttributeError) as exc:
+                logger.exception("Invalid DeepFace worker response")
                 if self._active:
                     self._active = False
                     self.failed.emit(f"Invalid DeepFace worker response: {exc}")
+
+    def _read_error_output(self) -> None:
+        stderr = bytes(self.process.readAllStandardError()).decode(errors="replace").strip()
+        if stderr:
+            logger.error("DeepFace worker stderr: %s", stderr)
 
     def _persist_batch(self, generation: int) -> None:
         if not self._active or generation != self._generation or not self._responses:
@@ -430,12 +451,14 @@ class AnalysisCoordinator(QObject):
         self.status.emit("Analysis complete")
 
     def _persist_error(self, generation: int, message: str) -> None:
+        logger.error("Analysis persistence callback failed for %s: %s", self._root, message)
         if generation == self._generation:
             self.failed.emit(f"Could not save analysis results: {message}")
         else:
             self.catalogue_changed.emit()
 
     def _process_error(self, error) -> None:
+        logger.error("DeepFace worker process error: %s", error)
         if self._starting_after_finish:
             return
         if (
@@ -460,6 +483,7 @@ class AnalysisCoordinator(QObject):
             and self._process_generation == self._generation
             and self._targets
         ):
+            logger.error("DeepFace worker stopped before analysis completed")
             self._active = False
             self.failed.emit("DeepFace worker stopped before analysis completed")
 
@@ -618,6 +642,7 @@ class MainWindow(QMainWindow):
 
     def _root_validation_error(self, serial: int, message: str) -> None:
         if serial == self._validation_serial:
+            logger.error("Root validation callback failed: %s", message)
             self._set_status(f"Could not validate root: {message}")
 
     def _scan_event(self, generation: int, result) -> None:
@@ -639,6 +664,7 @@ class MainWindow(QMainWindow):
 
     def _scan_error(self, generation: int, message: str) -> None:
         if generation == self._root_generation:
+            logger.error("Scan callback failed for %s: %s", self._root, message)
             self._set_status(f"Scan failed: {message}")
 
     def _refresh(self, generation: int) -> None:
@@ -685,10 +711,12 @@ class MainWindow(QMainWindow):
         if generation != self._root_generation:
             return
         self._set_status(f"Catalogue unavailable: {message}")
+        logger.error("Catalogue callback failed for %s: %s", self._root, message)
         self.browser.model.set_items([])
         self.calendar_model.set_groups({})
 
     def _refresh_error(self, generation: int, browser_serial: int, message: str) -> None:
+        logger.error("Catalogue refresh callback failed for %s: %s", self._root, message)
         if browser_serial == self._browser_serial:
             self._catalog_error(generation, message)
 
@@ -736,6 +764,7 @@ class MainWindow(QMainWindow):
         self._load_thumbnails(self.browser.model, items, generation)
 
     def _browser_error(self, generation: int, browser_serial: int, message: str) -> None:
+        logger.error("Browser catalogue callback failed for %s: %s", self._root, message)
         if generation == self._root_generation and browser_serial == self._browser_serial:
             self._catalog_error(generation, message)
 
@@ -760,6 +789,7 @@ class MainWindow(QMainWindow):
 
     def _detail_error(self, serial: int, message: str) -> None:
         if serial == self._detail_serial:
+            logger.error("Detail catalogue callback failed for image request: %s", message)
             self.detail.clear(f"Could not load details: {message}")
 
     def _visualisation_changed(self, enabled: bool) -> None:
@@ -787,6 +817,7 @@ class MainWindow(QMainWindow):
         self._refresh(self._root_generation)
 
     def _analysis_failed(self, message: str) -> None:
+        logger.error("Analysis failed: %s", message)
         self.cancel_button.setEnabled(False)
         self._set_status(message)
         self._refresh(self._root_generation)

@@ -6,11 +6,14 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
-from PySide6.QtCore import QAbstractListModel, QModelIndex, QSize, Qt
+from PySide6.QtCore import QAbstractListModel, QModelIndex, QRect, QSize, Qt
 from PySide6.QtGui import QColor, QPainter, QPixmap
 from PySide6.QtWidgets import QStyle, QStyleOptionViewItem, QStyledItemDelegate
 
 from imagelib.services.catalog import ImageListItem
+
+
+THUMBNAIL_SIZE = QSize(180, 172)
 
 
 class ThumbnailModel(QAbstractListModel):
@@ -35,7 +38,7 @@ class ThumbnailModel(QAbstractListModel):
         if role == Qt.ItemDataRole.ToolTipRole:
             return f"{item.relative_path}\n{item.status}"
         if role == Qt.ItemDataRole.SizeHintRole:
-            return QSize(180, 172)
+            return THUMBNAIL_SIZE
         return None
 
     def set_items(self, items: list[ImageListItem]) -> None:
@@ -56,6 +59,16 @@ class ThumbnailModel(QAbstractListModel):
 
 
 class ThumbnailDelegate(QStyledItemDelegate):
+    @staticmethod
+    def _pixmap_rect(image_rect: QRect, pixmap: QPixmap) -> QRect:
+        scaled = pixmap.scaled(
+            image_rect.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+        )
+        target = QRect(image_rect.topLeft(), scaled.size())
+        target.moveLeft(image_rect.left() + (image_rect.width() - scaled.width()) // 2)
+        target.moveTop(image_rect.top() + (image_rect.height() - scaled.height()) // 2)
+        return target
+
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
         painter.save()
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
@@ -64,9 +77,7 @@ class ThumbnailDelegate(QStyledItemDelegate):
         image_rect = option.rect.adjusted(8, 8, -8, -36)
         if isinstance(pixmap, QPixmap) and not pixmap.isNull():
             scaled = pixmap.scaled(image_rect.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-            target = image_rect
-            target.moveLeft(image_rect.left() + (image_rect.width() - scaled.width()) // 2)
-            target.moveTop(image_rect.top() + (image_rect.height() - scaled.height()) // 2)
+            target = self._pixmap_rect(image_rect, pixmap)
             painter.drawPixmap(target, scaled)
         else:
             painter.fillRect(image_rect, QColor("#15181c"))
@@ -77,7 +88,7 @@ class ThumbnailDelegate(QStyledItemDelegate):
         painter.restore()
 
     def sizeHint(self, option, index) -> QSize:
-        return QSize(180, 172)
+        return THUMBNAIL_SIZE
 
 
 @dataclass(frozen=True)
@@ -115,7 +126,7 @@ class CalendarModel(ThumbnailModel):
         if role == Qt.ItemDataRole.ToolTipRole:
             return f"{item.relative_path}\n{item.status}"
         if role == Qt.ItemDataRole.SizeHintRole:
-            return QSize(180, 172)
+            return THUMBNAIL_SIZE
         return None
 
     def flags(self, index):

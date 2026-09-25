@@ -1,5 +1,7 @@
 """Application entry point for the PySide6 desktop UI."""
 
+import logging
+
 from PySide6.QtWidgets import QApplication
 
 from imagelib import __version__
@@ -19,6 +21,10 @@ QStatusBar { background: #20252b; }
 
 
 def main() -> int:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     app = QApplication([])
     app.setApplicationName("image-library")
     app.setApplicationVersion(__version__)

@@ -7,15 +7,16 @@ from pathlib import Path
 import pytest
 
 try:
-    from PySide6.QtCore import QProcess, QThreadPool, Qt
+    from PySide6.QtCore import QProcess, QRect, QThreadPool, Qt
+    from PySide6.QtGui import QPixmap
     from PySide6.QtWidgets import QApplication
 except (ImportError, OSError):
     pytest.skip("Qt libraries are unavailable", allow_module_level=True)
 
 from imagelib.services.catalog import ImageListItem
-from imagelib.ui.main_window import AnalysisCoordinator, MainWindow
-from imagelib.ui.models import CalendarModel, ThumbnailModel
-from imagelib.ui.workers import ImageAssetTask
+from imagelib.ui.main_window import AnalysisCoordinator, DetailPanel, MainWindow
+from imagelib.ui.models import CalendarModel, ThumbnailDelegate, ThumbnailModel
+from imagelib.ui.workers import ImageAsset, ImageAssetTask
 
 
 @pytest.fixture(scope="session")
@@ -47,6 +48,17 @@ def test_thumbnail_model_exposes_rows_and_multi_selection_data(application):
     assert model.index(0, 0).data(Qt.ItemDataRole.UserRole).id == 1
 
 
+def test_thumbnail_delegate_keeps_portrait_and_landscape_bounds(application):
+    image_rect = QRect(0, 0, 164, 128)
+    delegate = ThumbnailDelegate()
+
+    portrait = delegate._pixmap_rect(image_rect, QPixmap(80, 160))
+    landscape = delegate._pixmap_rect(image_rect, QPixmap(320, 120))
+
+    assert (portrait.width(), portrait.height()) == (64, 128)
+    assert (landscape.width(), landscape.height()) == (164, 61)
+
+
 def test_calendar_model_has_date_sections_and_unknown_group(application):
     model = CalendarModel()
     model.set_groups({date(2026, 1, 2): [image_item(1, "one.jpg")], None: [image_item(2, "two.jpg")]})
@@ -72,6 +84,21 @@ def test_image_asset_worker_loads_face_crops(application, tmp_path):
 
     assert assets[0].crops[0].width() == 4
     assert assets[0].crops[0].height() == 5
+
+
+def test_detail_face_ribbon_has_room_for_face_cards(application):
+    panel = DetailPanel(QThreadPool())
+
+    class Face:
+        person_name = "Person"
+
+    panel._faces = (Face(),)
+    panel._asset_ready(0, ImageAsset(QPixmap(200, 200).toImage(), (QPixmap(96, 96).toImage(),)))
+
+    assert panel.face_scroll.minimumHeight() >= 152
+    assert panel.face_strip.minimumHeight() >= 140
+    assert panel.face_layout.itemAt(0).widget().sizeHint().height() >= 108
+    panel.deleteLater()
 
 
 def test_main_window_smoke_without_startup_database_query(application):
