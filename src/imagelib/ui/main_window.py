@@ -432,7 +432,7 @@ class AnalysisCoordinator(QObject):
     def _read_error_output(self) -> None:
         stderr = bytes(self.process.readAllStandardError()).decode(errors="replace").strip()
         if stderr:
-            logger.error("DeepFace worker stderr: %s", stderr)
+            logger.warning("DeepFace worker stderr: %s", stderr)
 
     def _persist_batch(self, generation: int) -> None:
         if not self._active or generation != self._generation or not self._responses:
