@@ -196,3 +196,22 @@ def test_analysis_coordinator_fails_on_unmatched_single_image_response(applicati
 
     assert not coordinator._active
     assert errors == ["Invalid DeepFace worker response: unexpected DeepFace worker request_id: None"]
+
+
+def test_analysis_coordinator_logs_worker_stderr_without_failing(application, caplog):
+    class Process:
+        def readAllStandardError(self):
+            return b"cudart_stub.cc:31] Could not find cuda drivers on your machine"
+
+    coordinator = AnalysisCoordinator(QThreadPool())
+    coordinator.process = Process()
+    coordinator._active = True
+    errors = []
+    coordinator.failed.connect(errors.append)
+
+    with caplog.at_level("WARNING"):
+        coordinator._read_error_output()
+
+    assert coordinator._active
+    assert errors == []
+    assert "DeepFace worker stderr" in caplog.text

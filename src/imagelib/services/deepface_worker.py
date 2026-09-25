@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from contextlib import redirect_stdout
 from pathlib import Path
 from typing import IO, Callable
 
@@ -72,6 +73,10 @@ def run_worker(
         output_stream.write(json.dumps(value, default=_json_default) + "\n")
         output_stream.flush()
 
+    def call_model(callback, *args):
+        with redirect_stdout(sys.stderr):
+            return callback(*args)
+
     for line in input_stream:
         if not line.strip():
             continue
@@ -87,8 +92,8 @@ def run_worker(
                 raise ValueError(f"unknown operation: {operation}")
             path = str(Path(request["path"]).expanduser().resolve())
             if model is None:
-                model = model_factory()
-            reply({"ok": True, "faces": representer(path, model), "request_id": request_id})
+                model = call_model(model_factory)
+            reply({"ok": True, "faces": call_model(representer, path, model), "request_id": request_id})
         except Exception as exc:
             reply(
                 {

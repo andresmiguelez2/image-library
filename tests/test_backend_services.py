@@ -1,5 +1,6 @@
 from datetime import datetime
 from io import StringIO
+import json
 from pathlib import Path
 import sys
 from types import ModuleType
@@ -412,6 +413,29 @@ def test_deepface_worker_loads_model_once():
     assert len(models) == 1
     assert '"ok": true' in lines[0]
     assert '"ok": true' in lines[1]
+
+
+def test_deepface_worker_redirects_model_output_and_returns_errors(capsys):
+    input_stream = StringIO('{"op":"analyse","path":"one.jpg"}\n{"op":"shutdown"}\n')
+    output_stream = StringIO()
+
+    def model_factory():
+        print("TensorFlow startup noise")
+        return object()
+
+    def representer(_path, _model):
+        print("DeepFace representer noise")
+        raise RuntimeError("analysis failed")
+
+    run_worker(input_stream, output_stream, model_factory=model_factory, representer=representer)
+
+    responses = [json.loads(line) for line in output_stream.getvalue().splitlines()]
+    assert responses[0]["ok"] is False
+    assert "analysis failed" in responses[0]["error"]
+    assert responses[1]["ok"] is True
+    stderr = capsys.readouterr().err
+    assert "TensorFlow startup noise" in stderr
+    assert "DeepFace representer noise" in stderr
 
 
 def test_deepface_worker_uses_configured_detector(monkeypatch):
