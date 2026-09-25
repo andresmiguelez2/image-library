@@ -14,6 +14,16 @@ from imagelib.services.catalog import ImageListItem
 
 
 THUMBNAIL_SIZE = QSize(180, 172)
+STATUS_COLOURS = {
+    "analysed": "#45c46b",
+    "error": "#ef5350",
+    "indexed": "#f0a43c",
+    "pending": "#f0a43c",
+}
+
+
+def status_colour(status: str | None) -> QColor:
+    return QColor(STATUS_COLOURS.get(status, "#8a939e"))
 
 
 class ThumbnailModel(QAbstractListModel):
@@ -82,6 +92,10 @@ class ThumbnailDelegate(QStyledItemDelegate):
         else:
             painter.fillRect(image_rect, QColor("#15181c"))
             painter.drawText(image_rect, Qt.AlignmentFlag.AlignCenter, "Loading…")
+            target = image_rect
+        item = index.data(Qt.ItemDataRole.UserRole)
+        painter.setPen(QColor(status_colour(getattr(item, "status", None))))
+        painter.drawRect(target.adjusted(1, 1, -2, -2))
         text_rect = option.rect.adjusted(8, option.rect.height() - 28, -8, -6)
         painter.setPen(QColor("#edf1f5"))
         painter.drawText(text_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, index.data())
