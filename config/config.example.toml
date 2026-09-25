@@ -10,8 +10,9 @@ window_height = 800
 dsn = "postgresql+psycopg://imagelib:imagelib@localhost:5432/imagelib"
 
 [scan]
-# Directories to watch. ~ is expanded on load.
-watched_dirs = ["~/Pictures"]
+# The default root and directories to watch. ~ is expanded on load.
+active_root = "~/Data/images"
+watched_dirs = ["~/Data/images"]
 # Content hash will still be required to detect changes.
 scan_interval_seconds = 300
 thumbnail_dir = "data/thumbnails"
