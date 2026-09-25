@@ -176,7 +176,6 @@ def _represent(path: Path, model) -> list[dict]:
     result = DeepFace.represent(
         img_path=str(path),
         model_name="Facenet512",
-        model=model,
         detector_backend=config["analysis"].get("detector_backend", "retinaface"),
         enforce_detection=False,
     )

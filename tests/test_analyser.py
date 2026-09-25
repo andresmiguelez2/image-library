@@ -53,6 +53,38 @@ def test_analyser_reuses_model_and_persists_faces(tmp_path: Path, monkeypatch) -
     assert calls == ["model"]
 
 
+def test_represent_matches_installed_deepface_api(tmp_path: Path, monkeypatch) -> None:
+    from deepface import DeepFace
+
+    image_path = tmp_path / "photo.jpg"
+    calls = []
+
+    def represent(*, img_path, model_name, detector_backend, enforce_detection):
+        calls.append(
+            {
+                "img_path": img_path,
+                "model_name": model_name,
+                "detector_backend": detector_backend,
+                "enforce_detection": enforce_detection,
+            }
+        )
+        return {"embedding": [0.1] * 512}
+
+    monkeypatch.setattr(DeepFace, "represent", represent)
+
+    result = analyser._represent(image_path, object())
+
+    assert result == [{"embedding": [0.1] * 512}]
+    assert calls == [
+        {
+            "img_path": str(image_path),
+            "model_name": "Facenet512",
+            "detector_backend": analyser.config["analysis"].get("detector_backend", "retinaface"),
+            "enforce_detection": False,
+        }
+    ]
+
+
 def _analysis_database(tmp_path: Path, count: int):
     engine = create_engine(
         "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
