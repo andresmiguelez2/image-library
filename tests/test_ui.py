@@ -172,3 +172,27 @@ def test_cancelled_analysis_refreshes_after_late_persistence(application):
     coordinator._batch_saved(1, object())
 
     assert changed == [True]
+
+
+def test_analysis_coordinator_fails_on_unmatched_single_image_response(application):
+    class Process:
+        def __init__(self):
+            self.read = True
+
+        def canReadLine(self):
+            return self.read
+
+        def readLine(self):
+            self.read = False
+            return b'{"ok": true, "faces": []}\n'
+
+    coordinator = AnalysisCoordinator(QThreadPool())
+    coordinator.process = Process()
+    coordinator._active = True
+    errors = []
+    coordinator.failed.connect(errors.append)
+
+    coordinator._read_output()
+
+    assert not coordinator._active
+    assert errors == ["Invalid DeepFace worker response: unexpected DeepFace worker request_id: None"]

@@ -1,6 +1,8 @@
 from datetime import datetime
 from io import StringIO
 from pathlib import Path
+import sys
+from types import ModuleType
 
 from PIL import Image as PillowImage
 from sqlalchemy import create_engine, select
@@ -410,3 +412,23 @@ def test_deepface_worker_loads_model_once():
     assert len(models) == 1
     assert '"ok": true' in lines[0]
     assert '"ok": true' in lines[1]
+
+
+def test_deepface_worker_uses_configured_detector(monkeypatch):
+    calls = []
+
+    class DeepFace:
+        @staticmethod
+        def represent(**kwargs):
+            calls.append(kwargs)
+            return []
+
+    from imagelib.services import deepface_worker
+
+    monkeypatch.setattr(deepface_worker, "config", {"analysis": {"detector_backend": "opencv"}})
+    fake_deepface = ModuleType("deepface")
+    fake_deepface.DeepFace = DeepFace
+    monkeypatch.setitem(sys.modules, "deepface", fake_deepface)
+    deepface_worker._default_representer("photo.jpg", object())
+
+    assert calls[0]["detector_backend"] == "opencv"

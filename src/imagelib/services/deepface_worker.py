@@ -20,6 +20,8 @@ import sys
 from pathlib import Path
 from typing import IO, Callable
 
+from imagelib.config import config
+
 
 def _default_model_factory():
     from deepface import DeepFace
@@ -34,7 +36,7 @@ def _default_representer(path: str, model):
         img_path=path,
         model_name="Facenet512",
         model=model,
-        detector_backend="retinaface",
+        detector_backend=config.get("analysis", {}).get("detector_backend", "retinaface"),
         enforce_detection=False,
     )
     return result if isinstance(result, list) else [result]

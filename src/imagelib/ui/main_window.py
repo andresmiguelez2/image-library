@@ -415,13 +415,15 @@ class AnalysisCoordinator(QObject):
                 request_id = response.get("request_id")
                 pending = self._pending.pop(request_id, None)
                 if pending is None or not self._active:
+                    if pending is None and self._active:
+                        raise ValueError(f"unexpected DeepFace worker request_id: {request_id!r}")
                     continue
                 target, _ = pending
                 self._responses.append((target, response))
                 self.progress.emit(len(self._responses), len(self._targets))
                 self.status.emit(f"Analysing {len(self._responses)} of {len(self._targets)}…")
                 self._send_next(self._generation)
-            except (UnicodeDecodeError, json.JSONDecodeError, AttributeError) as exc:
+            except (UnicodeDecodeError, json.JSONDecodeError, AttributeError, ValueError) as exc:
                 logger.exception("Invalid DeepFace worker response")
                 if self._active:
                     self._active = False
