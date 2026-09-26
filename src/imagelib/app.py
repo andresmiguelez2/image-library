@@ -5,6 +5,7 @@ import logging
 from PySide6.QtWidgets import QApplication
 
 from imagelib import __version__
+from imagelib.diagnostics import diagnostic
 from imagelib.ui.main_window import MainWindow
 
 
@@ -21,6 +22,7 @@ QStatusBar { background: #20252b; }
 
 
 def main() -> int:
+    diagnostic("Starting image-library UI")
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",

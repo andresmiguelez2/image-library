@@ -14,6 +14,7 @@ except (ImportError, OSError):
     pytest.skip("Qt libraries are unavailable", allow_module_level=True)
 
 from imagelib.services.catalog import ImageListItem
+from imagelib.services import analyser
 from imagelib.ui.main_window import AnalysisCoordinator, DetailPanel, FaceImageWidget, MainWindow
 from imagelib.ui.models import CalendarModel, ThumbnailDelegate, ThumbnailModel, status_colour
 from imagelib.ui.workers import ImageAsset, ImageAssetTask
@@ -234,7 +235,7 @@ def test_analysis_coordinator_logs_per_image_worker_errors(application, caplog):
     assert statuses == ["Analysis complete with 1 error(s): TypeError: unsupported DeepFace.represent argument"]
 
 
-def test_analysis_coordinator_fails_on_unmatched_single_image_response(application):
+def test_analysis_coordinator_fails_on_unmatched_single_image_response(application, capsys):
     class Process:
         def __init__(self):
             self.read = True
@@ -256,6 +257,9 @@ def test_analysis_coordinator_fails_on_unmatched_single_image_response(applicati
 
     assert not coordinator._active
     assert errors == ["Invalid DeepFace worker response: unexpected DeepFace worker request_id: None"]
+    stderr = capsys.readouterr().err
+    assert 'DeepFace worker raw stdout response: {"ok": true, "faces": []}' in stderr
+    assert "response parsed request_id=None status='ok'" in stderr
 
 
 def test_analysis_coordinator_logs_worker_stderr_without_failing(application, caplog):
@@ -275,3 +279,94 @@ def test_analysis_coordinator_logs_worker_stderr_without_failing(application, ca
     assert coordinator._active
     assert errors == []
     assert "DeepFace worker stderr" in caplog.text
+
+
+def test_analysis_coordinator_prints_analysis_targets(application, capsys):
+    class Process:
+        def state(self):
+            return QProcess.ProcessState.NotRunning
+
+        def setProgram(self, _program):
+            pass
+
+        def setArguments(self, _arguments):
+            pass
+
+        def setProcessEnvironment(self, _environment):
+            pass
+
+        def start(self):
+            pass
+
+    coordinator = AnalysisCoordinator(QThreadPool())
+    coordinator.process = Process()
+    coordinator._active = True
+    coordinator._generation = 1
+    coordinator._targets_ready(
+        1,
+        [analyser.AnalysisTarget(7, "/photos/foto-ñ.jpg", "abc123", "indexed")],
+    )
+
+    stderr = capsys.readouterr().err
+    assert "Analysis targets selected count=1" in stderr
+    assert "image_id=7" in stderr
+    assert "foto-ñ.jpg" in stderr
+    assert "status='indexed'" in stderr
+    assert "content_hash='abc123'" in stderr
+    assert "DeepFace worker executable=" in stderr
+
+
+def test_analysis_coordinator_prints_start_root_and_selected_ids(application, capsys):
+    class Pool:
+        def start(self, task):
+            self.task = task
+
+    coordinator = AnalysisCoordinator(QThreadPool())
+    coordinator.pool = Pool()
+    coordinator.start(Path("/photos"), image_ids=[7, 8])
+
+    stderr = capsys.readouterr().err
+    assert "Analysis start root=/photos selected_image_ids=[7, 8]" in stderr
+
+
+def test_analysis_coordinator_prints_sent_request(application, capsys):
+    class Process:
+        def __init__(self):
+            self.requests = []
+
+        def state(self):
+            return QProcess.ProcessState.Running
+
+        def write(self, request):
+            self.requests.append(request)
+
+    process = Process()
+    coordinator = AnalysisCoordinator(QThreadPool())
+    coordinator.process = process
+    coordinator._active = True
+    coordinator._generation = 1
+    coordinator._targets = [analyser.AnalysisTarget(7, "/photos/foto-ñ.jpg", "abc123", "indexed")]
+
+    coordinator._send_next(1)
+
+    stderr = capsys.readouterr().err
+    assert "Analysis request sent:" in stderr
+    assert '"request_id": "1:0"' in stderr
+    assert process.requests[0].endswith(b"\n")
+
+
+def test_analysis_coordinator_prints_process_exit_diagnostics(application, capsys):
+    coordinator = AnalysisCoordinator(QThreadPool())
+    coordinator._active = True
+    coordinator._generation = 1
+    coordinator._process_generation = 1
+    coordinator._targets = [object()]
+    errors = []
+    coordinator.failed.connect(errors.append)
+
+    coordinator._process_finished(17, QProcess.ExitStatus.CrashExit)
+
+    stderr = capsys.readouterr().err
+    assert "exit_code=17" in stderr
+    assert "status=" in stderr
+    assert errors == ["DeepFace worker stopped before analysis completed"]

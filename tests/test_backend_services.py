@@ -11,6 +11,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from imagelib.db.models import Base, Face, Image, Person, Source
+from imagelib.diagnostics import diagnostic
 from imagelib.services import analyser, catalog, scanner
 from imagelib.services.deepface_worker import run_worker
 
@@ -350,7 +351,7 @@ def test_process_worker_response_persists_atomically_and_rejects_stale_hash(tmp_
     assert not stale.accepted and stale.status == "stale"
 
 
-def test_process_batch_rebuild_api_uses_fake_faces_without_deepface(tmp_path):
+def test_process_batch_rebuild_api_uses_fake_faces_without_deepface(tmp_path, capsys):
     factory = database()
     embedding = [1.0] + [0.0] * 511
     with factory() as session:
@@ -390,6 +391,10 @@ def test_process_batch_rebuild_api_uses_fake_faces_without_deepface(tmp_path):
     assert [result.status for result in batch.results] == ["analysed", "analysed"]
     assert batch.clusters.faces == 2
     assert batch.clusters.clustered_faces == 2
+    stderr = capsys.readouterr().err
+    assert "Analysis persistence service started" in stderr
+    assert "Analysis persistence image completed image_id=" in stderr
+    assert "Analysis persistence service completed" in stderr
 
 
 def test_deepface_worker_loads_model_once():
@@ -441,6 +446,29 @@ def test_deepface_worker_redirects_model_output_and_returns_errors(capsys):
     stderr = capsys.readouterr().err
     assert "TensorFlow startup noise" in stderr
     assert "DeepFace representer noise" in stderr
+    assert "DeepFace worker request operation='analyse'" in stderr
+    assert "path='one.jpg'" in stderr
+    assert "RuntimeError: analysis failed" in stderr
+    assert "Traceback (most recent call last)" in stderr
+
+
+def test_diagnostic_flushes_to_supplied_stream():
+    class Stream:
+        def __init__(self):
+            self.values = []
+            self.flush_count = 0
+
+        def write(self, value):
+            self.values.append(value)
+
+        def flush(self):
+            self.flush_count += 1
+
+    stream = Stream()
+    diagnostic("flushed", stream=stream)
+
+    assert "flushed" in "".join(stream.values)
+    assert stream.flush_count == 1
 
 
 def test_deepface_worker_default_representer_matches_installed_api(tmp_path, monkeypatch):
