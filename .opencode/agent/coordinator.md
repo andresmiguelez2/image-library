@@ -3,7 +3,6 @@ description: Coordinates code development work. Plans, delegates to specialist s
 mode: primary
 # model: 
 temperature: 0.2
-effort: high
 permission:
   edit: deny
   bash:
@@ -15,6 +14,9 @@ permission:
     "image-analyser": allow
     "qt-developer": allow
     "bug-fixer": allow
+  external_directory:
+    "/home/amiguelez/playground/**": allow
+    "*": ask
 ---
 
 # Role
