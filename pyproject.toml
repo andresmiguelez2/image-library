@@ -16,6 +16,7 @@ dependencies = [
     "deepface>=0.0.80",
     "tf-keras>=2.20",
     "tqdm>=4.66",
+    "matplotlib>=3.10.9",
 ]
 
 [dependency-groups]
