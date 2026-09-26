@@ -1,5 +1,6 @@
 {
     "conventionalCommits.scopes": [
-        "agents"
+        "agents",
+        "notebooks"
     ]
 }
