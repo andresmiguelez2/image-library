@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
+from datetime import date, timedelta
 from pathlib import Path
 from threading import Event
 
@@ -15,17 +16,19 @@ from PySide6.QtCore import (
     QProcess,
     QProcessEnvironment,
     QRect,
+    QSize,
     QThreadPool,
     QTimer,
     Qt,
     Signal,
 )
-from PySide6.QtGui import QColor, QImage, QPainter, QPixmap
+from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QFileDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -37,6 +40,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSplitter,
     QStackedWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -44,7 +48,7 @@ from PySide6.QtWidgets import (
 from imagelib.config import config
 from imagelib.diagnostics import diagnostic, diagnostic_exception
 from imagelib.services import analyser, catalog
-from imagelib.ui.models import CalendarDelegate, CalendarModel, ThumbnailDelegate, ThumbnailModel
+from imagelib.ui.models import CalendarModel, ThumbnailDelegate, ThumbnailModel
 from imagelib.ui.workers import FunctionTask, ImageAsset, ImageAssetTask, RootValidationTask, ScanTask
 
 
@@ -80,6 +84,263 @@ class CollectionView(QListView):
 
     def selected_image_ids(self) -> list[int]:
         return [item.id for item in (self.model().item(index) for index in self.selectedIndexes()) if item]
+
+
+class CalendarDayCell(QFrame):
+    image_clicked = Signal(object)
+    selection_changed = Signal()
+
+    def __init__(
+        self,
+        day: date | None,
+        items,
+        pixmaps: dict[int, QPixmap],
+        selected_ids: set[int],
+        outside_month: bool = False,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.day = day
+        self.items = list(items)
+        self._buttons: dict[int, QToolButton] = {}
+        self.setObjectName("calendarOutsideDay" if outside_month else "calendarDay")
+        self.setProperty("outsideMonth", outside_month)
+        self.setMinimumHeight(96)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+
+        header = QHBoxLayout()
+        header.setContentsMargins(5, 4, 5, 2)
+        header.setSpacing(4)
+        heading = QLabel(str(day.day) if day else "Unknown date")
+        heading.setObjectName("calendarDayNumber")
+        header.addWidget(heading)
+        if self.items:
+            count = QLabel(str(len(self.items)))
+            count.setToolTip(f"{len(self.items)} image(s)")
+            header.addWidget(count)
+            self.select_button = QToolButton()
+            self.select_button.setText("All")
+            self.select_button.setToolTip("Select all images in this date")
+            self.select_button.setCheckable(True)
+            self.select_button.setAutoRaise(True)
+            self.select_button.clicked.connect(self._select_all)
+            header.addWidget(self.select_button)
+        else:
+            self.select_button = None
+        header.addStretch(1)
+
+        self.image_layout = QGridLayout()
+        self.image_layout.setContentsMargins(4, 2, 4, 4)
+        self.image_layout.setSpacing(3)
+        self.image_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        for index, item in enumerate(self.items):
+            button = QToolButton()
+            button.setCheckable(True)
+            button.setAutoRaise(True)
+            button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+            button.setIconSize(QSize(48, 48))
+            button.setFixedSize(54, 54)
+            button.setToolTip(f"{item.relative_path}\nClick to open image details")
+            button.setAccessibleName(Path(item.path).name)
+            button.toggled.connect(lambda _checked, b=button: self._button_toggled(b))
+            button.clicked.connect(lambda _checked=False, image=item: self.image_clicked.emit(image))
+            self._buttons[item.id] = button
+            self._set_button_pixmap(button, pixmaps.get(item.id))
+            button.setChecked(item.id in selected_ids)
+            self.image_layout.addWidget(button, index // 3, index % 3)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addLayout(header)
+        layout.addLayout(self.image_layout)
+        self._update_select_button()
+
+    @staticmethod
+    def _set_button_pixmap(button: QToolButton, pixmap: QPixmap | None) -> None:
+        if isinstance(pixmap, QPixmap) and not pixmap.isNull():
+            button.setIcon(QIcon(pixmap))
+            button.setText("")
+        else:
+            button.setIcon(QIcon())
+            button.setText("…")
+
+    def _button_toggled(self, button: QToolButton) -> None:
+        self._update_select_button()
+        self.selection_changed.emit()
+
+    def _update_select_button(self) -> None:
+        if self.select_button is not None:
+            selected = bool(self.items) and all(button.isChecked() for button in self._buttons.values())
+            self.select_button.blockSignals(True)
+            self.select_button.setChecked(selected)
+            self.select_button.blockSignals(False)
+
+    def _select_all(self, checked: bool) -> None:
+        for button in self._buttons.values():
+            button.setChecked(checked)
+        self._update_select_button()
+        self.selection_changed.emit()
+
+    def set_pixmap(self, image_id: int, pixmap: QPixmap) -> None:
+        button = self._buttons.get(image_id)
+        if button is not None:
+            self._set_button_pixmap(button, pixmap)
+
+    def selected_image_ids(self) -> list[int]:
+        return [image_id for image_id, button in self._buttons.items() if button.isChecked()]
+
+
+class CalendarView(QWidget):
+    image_clicked = Signal(object)
+    month_changed = Signal(object)
+
+    def __init__(self, model: CalendarModel, parent=None) -> None:
+        super().__init__(parent)
+        self.model = model
+        self._selected_ids: set[int] = set()
+        self.current_month = date.today().replace(day=1)
+        self.day_cells: dict[date, CalendarDayCell] = {}
+        self.unknown_cell: CalendarDayCell | None = None
+
+        previous = QPushButton("‹")
+        previous.setToolTip("Previous month")
+        previous.clicked.connect(lambda: self.set_month(self._offset_month(-1)))
+        next_month = QPushButton("›")
+        next_month.setToolTip("Next month")
+        next_month.clicked.connect(lambda: self.set_month(self._offset_month(1)))
+        today = QPushButton("Today")
+        today.clicked.connect(lambda: self.set_month(date.today().replace(day=1)))
+        self.month_label = QLabel()
+        self.month_label.setObjectName("calendarMonthLabel")
+        self.month_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        toolbar = QHBoxLayout()
+        toolbar.addWidget(previous)
+        toolbar.addWidget(self.month_label, 1)
+        toolbar.addWidget(today)
+        toolbar.addWidget(next_month)
+
+        weekdays = QGridLayout()
+        weekdays.setContentsMargins(3, 0, 3, 0)
+        weekdays.setSpacing(3)
+        for column, name in enumerate(("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")):
+            label = QLabel(name)
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            label.setObjectName("calendarWeekday")
+            weekdays.addWidget(label, 0, column)
+
+        self.grid_widget = QWidget()
+        self.grid_layout = QGridLayout(self.grid_widget)
+        self.grid_layout.setContentsMargins(3, 3, 3, 3)
+        self.grid_layout.setSpacing(3)
+        for column in range(7):
+            self.grid_layout.setColumnStretch(column, 1)
+        self.grid_scroll = QScrollArea()
+        self.grid_scroll.setWidgetResizable(True)
+        self.grid_scroll.setWidget(self.grid_widget)
+
+        self.unknown_title = QLabel("Unknown date")
+        self.unknown_title.setObjectName("calendarUnknownTitle")
+        self.unknown_layout = QVBoxLayout()
+        self.unknown_layout.setContentsMargins(0, 0, 0, 0)
+        self.unknown_layout.addWidget(self.unknown_title)
+        self.unknown_area = QWidget()
+        self.unknown_area.setLayout(self.unknown_layout)
+        self.unknown_area.setVisible(False)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(toolbar)
+        layout.addLayout(weekdays)
+        layout.addWidget(self.grid_scroll, 1)
+        layout.addWidget(self.unknown_area)
+
+        self.model.modelReset.connect(self._render)
+        self.model.pixmap_changed.connect(self.set_pixmap)
+        self._render()
+
+    @staticmethod
+    def _first_of_month(value: date) -> date:
+        return value.replace(day=1)
+
+    def _offset_month(self, offset: int) -> date:
+        month = self.current_month.month - 1 + offset
+        year = self.current_month.year + month // 12
+        return date(year, month % 12 + 1, 1)
+
+    def set_month(self, month: date) -> None:
+        month = self._first_of_month(month)
+        if month == self.current_month:
+            self._render()
+            return
+        self.current_month = month
+        self._render()
+        self.month_changed.emit(month)
+
+    def _clear_layout(self, layout) -> None:
+        while layout.count():
+            child = layout.takeAt(0)
+            if child.widget() is not None:
+                child.widget().deleteLater()
+
+    def _render(self) -> None:
+        all_ids = {item.id for item in self.model.items}
+        self._selected_ids.intersection_update(all_ids)
+        self.month_label.setText(self.current_month.strftime("%B %Y"))
+        self._clear_layout(self.grid_layout)
+        self.day_cells = {}
+        first = self.current_month
+        for position in range(42):
+            day = first + timedelta(days=position - first.weekday())
+            in_month = day.month == first.month
+            cell = CalendarDayCell(
+                day,
+                self.model.groups.get(day, []) if in_month else [],
+                self.model.pixmaps,
+                self._selected_ids,
+                outside_month=not in_month,
+                parent=self.grid_widget,
+            )
+            cell.image_clicked.connect(self.image_clicked)
+            cell.selection_changed.connect(lambda c=cell: self._cell_selection_changed(c))
+            self.grid_layout.addWidget(cell, position // 7, position % 7)
+            self.day_cells[day] = cell
+
+        while self.unknown_layout.count() > 1:
+            child = self.unknown_layout.takeAt(1)
+            if child.widget() is not None:
+                child.widget().deleteLater()
+        unknown_items = self.model.groups.get(None, [])
+        self.unknown_cell = None
+        if unknown_items:
+            self.unknown_cell = CalendarDayCell(
+                None,
+                unknown_items,
+                self.model.pixmaps,
+                self._selected_ids,
+                parent=self.unknown_area,
+            )
+            self.unknown_cell.image_clicked.connect(self.image_clicked)
+            self.unknown_cell.selection_changed.connect(
+                lambda c=self.unknown_cell: self._cell_selection_changed(c)
+            )
+            self.unknown_layout.addWidget(self.unknown_cell)
+            self.unknown_area.setVisible(True)
+        else:
+            self.unknown_area.setVisible(False)
+
+    def _cell_selection_changed(self, cell: CalendarDayCell) -> None:
+        cell_ids = {item.id for item in cell.items}
+        self._selected_ids.difference_update(cell_ids)
+        self._selected_ids.update(cell.selected_image_ids())
+
+    def set_pixmap(self, image_id: int, pixmap: QPixmap) -> None:
+        for cell in self.day_cells.values():
+            cell.set_pixmap(image_id, pixmap)
+        if self.unknown_cell is not None:
+            self.unknown_cell.set_pixmap(image_id, pixmap)
+
+    def selected_image_ids(self) -> list[int]:
+        return [item.id for item in self.model.items if item.id in self._selected_ids]
 
 
 class FaceImageWidget(QWidget):
@@ -660,9 +921,7 @@ class MainWindow(QMainWindow):
         self.browser.directory_changed.connect(self._browse_directory)
         self.browser.image_clicked.connect(self._image_clicked)
         self.calendar_model = CalendarModel(self)
-        self.calendar = CollectionView(self.calendar_model, self)
-        self.calendar.setUniformItemSizes(False)
-        self.calendar.setItemDelegate(CalendarDelegate(self.calendar))
+        self.calendar = CalendarView(self.calendar_model, self)
         self.calendar.image_clicked.connect(self._image_clicked)
         self.calendar_stack = QStackedWidget()
         self.calendar_stack.addWidget(self.browser)
@@ -793,7 +1052,7 @@ class MainWindow(QMainWindow):
         self.calendar_model.set_groups(groups)
         if browser_serial == self._browser_serial and directory == self.browser.directory:
             self._load_thumbnails(self.browser.model, browser_items, generation)
-        self._load_thumbnails(self.calendar_model, [entry.item for entry in self.calendar_model.entries if entry.item], generation)
+        self._load_thumbnails(self.calendar_model, self.calendar_model.items, generation)
 
     def _catalog_error(self, generation: int, message: str) -> None:
         if generation != self._root_generation:

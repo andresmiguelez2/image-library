@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import pytest
@@ -15,7 +15,7 @@ except (ImportError, OSError):
 
 from imagelib.services.catalog import ImageListItem
 from imagelib.services import analyser
-from imagelib.ui.main_window import AnalysisCoordinator, DetailPanel, FaceImageWidget, MainWindow
+from imagelib.ui.main_window import AnalysisCoordinator, CalendarView, DetailPanel, FaceImageWidget, MainWindow
 from imagelib.ui.models import CalendarModel, ThumbnailDelegate, ThumbnailModel, status_colour
 from imagelib.ui.workers import ImageAsset, ImageAssetTask
 
@@ -26,15 +26,21 @@ def application():
     return QApplication.instance() or QApplication([])
 
 
-def image_item(image_id: int, path: str, status: str = "indexed") -> ImageListItem:
+def image_item(
+    image_id: int,
+    path: str,
+    status: str = "indexed",
+    taken_at: datetime | None = None,
+    modified_at: datetime | None = None,
+) -> ImageListItem:
     return ImageListItem(
         id=image_id,
         path=path,
         relative_path=path,
         breadcrumbs=tuple(path.split("/")),
         thumb_path=None,
-        taken_at=None,
-        modified_at=None,
+        taken_at=taken_at,
+        modified_at=modified_at,
         width=10,
         height=10,
         face_count=0,
@@ -98,13 +104,100 @@ def test_detail_face_rectangles_preserve_letterbox_geometry(application):
     assert widget._visualise is False
 
 
-def test_calendar_model_has_date_sections_and_unknown_group(application):
+def test_calendar_model_keeps_date_groups_and_unknown_images(application):
     model = CalendarModel()
     model.set_groups({date(2026, 1, 2): [image_item(1, "one.jpg")], None: [image_item(2, "two.jpg")]})
-    assert model.rowCount() == 4
-    assert model.index(0, 0).data() == "2026-01-02"
-    assert model.index(2, 0).data() == "Unknown date"
-    assert model.item(model.index(3, 0)).id == 2
+    assert model.rowCount() == 2
+    assert model.groups[date(2026, 1, 2)][0].id == 1
+    assert model.groups[None][0].id == 2
+
+
+def test_calendar_month_layout_places_images_on_their_dates(application):
+    model = CalendarModel()
+    model.set_groups(
+        {
+            date(2026, 1, 2): [image_item(1, "one.jpg")],
+            date(2026, 1, 31): [image_item(2, "two.jpg")],
+            None: [image_item(3, "unknown.jpg")],
+        }
+    )
+    calendar = CalendarView(model)
+    calendar.set_month(date(2026, 1, 1))
+
+    assert len(calendar.day_cells) == 42
+    assert [item.id for item in calendar.day_cells[date(2026, 1, 2)].items] == [1]
+    assert [item.id for item in calendar.day_cells[date(2026, 1, 31)].items] == [2]
+    assert calendar.unknown_cell is not None
+    assert calendar.unknown_cell.items[0].id == 3
+    assert calendar.month_label.text() == "January 2026"
+    calendar.deleteLater()
+
+
+def test_calendar_thumbnail_updates_after_model_pixmap_is_set(application):
+    model = CalendarModel()
+    model.set_groups({date(2026, 1, 2): [image_item(1, "one.jpg")]})
+    calendar = CalendarView(model)
+    calendar.set_month(date(2026, 1, 1))
+    button = calendar.day_cells[date(2026, 1, 2)]._buttons[1]
+
+    assert button.icon().isNull()
+    model.set_pixmap(1, QPixmap(20, 20))
+
+    assert not button.icon().isNull()
+    calendar.deleteLater()
+
+
+def test_calendar_navigation_renders_the_requested_month(application):
+    model = CalendarModel()
+    model.set_groups(
+        {
+            date(2026, 1, 2): [image_item(1, "one.jpg")],
+            date(2026, 2, 2): [image_item(2, "two.jpg")],
+        }
+    )
+    calendar = CalendarView(model)
+    calendar.set_month(date(2026, 1, 1))
+    calendar.set_month(date(2026, 2, 1))
+
+    assert calendar.month_label.text() == "February 2026"
+    assert [item.id for item in calendar.day_cells[date(2026, 2, 2)].items] == [2]
+    calendar.deleteLater()
+
+
+def test_calendar_image_click_and_select_all_expose_image_ids(application):
+    model = CalendarModel()
+    model.set_groups(
+        {date(2026, 1, 2): [image_item(1, "one.jpg"), image_item(2, "two.jpg")]}
+    )
+    calendar = CalendarView(model)
+    calendar.set_month(date(2026, 1, 1))
+    cell = calendar.day_cells[date(2026, 1, 2)]
+    clicked = []
+    calendar.image_clicked.connect(clicked.append)
+
+    cell._buttons[1].click()
+    assert clicked == [cell.items[0]]
+    assert calendar.selected_image_ids() == [1]
+
+    cell.select_button.click()
+    assert calendar.selected_image_ids() == [1, 2]
+    calendar.deleteLater()
+
+
+def test_main_window_analysis_uses_calendar_selection(application):
+    window = MainWindow()
+    window._root_generation = 1
+    window.calendar_model.set_groups({date(2026, 1, 2): [image_item(7, "seven.jpg")]})
+    window.calendar.set_month(date(2026, 1, 1))
+    window.calendar.day_cells[date(2026, 1, 2)].select_button.click()
+    calls = []
+    window.analysis.start = lambda root, image_ids=None: calls.append((root, image_ids))
+    window.calendar_stack.setCurrentWidget(window.calendar)
+
+    window._analyse_selected()
+
+    assert calls == [(window._root, [7])]
+    window.close()
 
 
 def test_image_asset_worker_loads_face_crops(application, tmp_path):
