@@ -164,6 +164,53 @@ def test_calendar_navigation_renders_the_requested_month(application):
     calendar.deleteLater()
 
 
+def test_calendar_direct_month_and_year_navigation_renders_images(application):
+    model = CalendarModel()
+    model.set_groups(
+        {
+            date(2031, 5, 2): [image_item(1, "distant.jpg")],
+        }
+    )
+    calendar = CalendarView(model)
+
+    calendar.month_selector.setCurrentIndex(4)
+    assert calendar.current_month == date(date.today().year, 5, 1)
+    calendar.year_selector.setValue(2031)
+
+    assert calendar.current_month == date(2031, 5, 1)
+    assert calendar.month_label.text() == "May 2031"
+    assert [item.id for item in calendar.day_cells[date(2031, 5, 2)].items] == [1]
+    calendar.deleteLater()
+
+
+def test_calendar_navigation_controls_synchronise_without_signal_loops(application):
+    model = CalendarModel()
+    calendar = CalendarView(model)
+    changes = []
+    calendar.month_changed.connect(changes.append)
+
+    calendar.set_month(date(1, 1, 1))
+    assert calendar.month_selector.currentIndex() == 0
+    assert calendar.year_selector.value() == 1
+    assert not calendar.previous_button.isEnabled()
+    assert calendar.next_button.isEnabled()
+    assert changes == [date(1, 1, 1)]
+
+    calendar.set_month(date(9999, 12, 1))
+    assert calendar.month_selector.currentIndex() == 11
+    assert calendar.year_selector.value() == 9999
+    assert calendar.previous_button.isEnabled()
+    assert not calendar.next_button.isEnabled()
+    assert changes == [date(1, 1, 1), date(9999, 12, 1)]
+
+    calendar.set_month(date(2026, 6, 1))
+    changes.clear()
+    calendar.month_selector.setCurrentIndex(6)
+    assert calendar.current_month == date(2026, 7, 1)
+    assert changes == [date(2026, 7, 1)]
+    calendar.deleteLater()
+
+
 def test_calendar_image_click_and_select_all_expose_image_ids(application):
     model = CalendarModel()
     model.set_groups(

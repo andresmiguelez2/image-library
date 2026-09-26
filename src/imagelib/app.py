@@ -11,7 +11,7 @@ from imagelib.ui.main_window import MainWindow
 
 STYLE = """
 QMainWindow, QWidget { background: #181b1f; color: #edf1f5; }
-QLineEdit, QScrollArea, QListView { background: #20252b; border: 1px solid #3c4652; border-radius: 4px; color: #edf1f5; }
+QLineEdit, QComboBox, QSpinBox, QScrollArea, QListView { background: #20252b; border: 1px solid #3c4652; border-radius: 4px; color: #edf1f5; }
 QPushButton { background: #2f3b49; border: 1px solid #536273; border-radius: 4px; padding: 6px 10px; }
 QPushButton:hover { background: #405267; }
 QToolButton { background: #2f3b49; border: 1px solid #536273; border-radius: 4px; padding: 2px; }

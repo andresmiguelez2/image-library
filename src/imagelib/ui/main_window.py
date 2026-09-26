@@ -26,6 +26,7 @@ from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -38,6 +39,7 @@ from PySide6.QtWidgets import (
     QRadioButton,
     QScrollArea,
     QSizePolicy,
+    QSpinBox,
     QSplitter,
     QStackedWidget,
     QToolButton,
@@ -194,6 +196,8 @@ class CalendarDayCell(QFrame):
 class CalendarView(QWidget):
     image_clicked = Signal(object)
     month_changed = Signal(object)
+    _minimum_month = date.min.replace(day=1)
+    _maximum_month = date.max.replace(day=1)
 
     def __init__(self, model: CalendarModel, parent=None) -> None:
         super().__init__(parent)
@@ -202,23 +206,39 @@ class CalendarView(QWidget):
         self.current_month = date.today().replace(day=1)
         self.day_cells: dict[date, CalendarDayCell] = {}
         self.unknown_cell: CalendarDayCell | None = None
+        self._syncing_navigation_controls = False
 
-        previous = QPushButton("‹")
-        previous.setToolTip("Previous month")
-        previous.clicked.connect(lambda: self.set_month(self._offset_month(-1)))
-        next_month = QPushButton("›")
-        next_month.setToolTip("Next month")
-        next_month.clicked.connect(lambda: self.set_month(self._offset_month(1)))
-        today = QPushButton("Today")
-        today.clicked.connect(lambda: self.set_month(date.today().replace(day=1)))
+        self.previous_button = QPushButton("‹")
+        self.previous_button.setToolTip("Previous month")
+        self.previous_button.clicked.connect(lambda: self.set_month(self._offset_month(-1)))
+        self.next_button = QPushButton("›")
+        self.next_button.setToolTip("Next month")
+        self.next_button.clicked.connect(lambda: self.set_month(self._offset_month(1)))
+        self.today_button = QPushButton("Today")
+        self.today_button.clicked.connect(lambda: self.set_month(date.today().replace(day=1)))
+        self.month_selector = QComboBox()
+        self.month_selector.addItems(
+            [date(2000, month, 1).strftime("%B") for month in range(1, 13)]
+        )
+        self.month_selector.setToolTip("Select month")
+        self.month_selector.setAccessibleName("Calendar month")
+        self.month_selector.currentIndexChanged.connect(self._month_selector_changed)
+        self.year_selector = QSpinBox()
+        self.year_selector.setRange(date.min.year, date.max.year)
+        self.year_selector.setKeyboardTracking(True)
+        self.year_selector.setToolTip("Enter year")
+        self.year_selector.setAccessibleName("Calendar year")
+        self.year_selector.valueChanged.connect(self._year_selector_changed)
         self.month_label = QLabel()
         self.month_label.setObjectName("calendarMonthLabel")
         self.month_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         toolbar = QHBoxLayout()
-        toolbar.addWidget(previous)
+        toolbar.addWidget(self.previous_button)
         toolbar.addWidget(self.month_label, 1)
-        toolbar.addWidget(today)
-        toolbar.addWidget(next_month)
+        toolbar.addWidget(self.month_selector)
+        toolbar.addWidget(self.year_selector)
+        toolbar.addWidget(self.today_button)
+        toolbar.addWidget(self.next_button)
 
         weekdays = QGridLayout()
         weekdays.setContentsMargins(3, 0, 3, 0)
@@ -256,6 +276,7 @@ class CalendarView(QWidget):
 
         self.model.modelReset.connect(self._render)
         self.model.pixmap_changed.connect(self.set_pixmap)
+        self._sync_navigation_controls()
         self._render()
 
     @staticmethod
@@ -263,16 +284,42 @@ class CalendarView(QWidget):
         return value.replace(day=1)
 
     def _offset_month(self, offset: int) -> date:
-        month = self.current_month.month - 1 + offset
-        year = self.current_month.year + month // 12
-        return date(year, month % 12 + 1, 1)
+        month_number = self.current_month.year * 12 + self.current_month.month - 1 + offset
+        minimum_number = self._minimum_month.year * 12 + self._minimum_month.month - 1
+        maximum_number = self._maximum_month.year * 12 + self._maximum_month.month - 1
+        month_number = max(minimum_number, min(maximum_number, month_number))
+        return date(month_number // 12, month_number % 12 + 1, 1)
+
+    def _month_selector_changed(self, month_index: int) -> None:
+        if not self._syncing_navigation_controls:
+            self.set_month(date(self.year_selector.value(), month_index + 1, 1))
+
+    def _year_selector_changed(self, year: int) -> None:
+        if not self._syncing_navigation_controls:
+            self.set_month(date(year, self.month_selector.currentIndex() + 1, 1))
+
+    def _sync_navigation_controls(self) -> None:
+        self._syncing_navigation_controls = True
+        try:
+            self.month_selector.blockSignals(True)
+            self.year_selector.blockSignals(True)
+            self.month_selector.setCurrentIndex(self.current_month.month - 1)
+            self.year_selector.setValue(self.current_month.year)
+        finally:
+            self.month_selector.blockSignals(False)
+            self.year_selector.blockSignals(False)
+            self._syncing_navigation_controls = False
+        self.previous_button.setEnabled(self.current_month > self._minimum_month)
+        self.next_button.setEnabled(self.current_month < self._maximum_month)
 
     def set_month(self, month: date) -> None:
         month = self._first_of_month(month)
         if month == self.current_month:
+            self._sync_navigation_controls()
             self._render()
             return
         self.current_month = month
+        self._sync_navigation_controls()
         self._render()
         self.month_changed.emit(month)
 
@@ -290,7 +337,14 @@ class CalendarView(QWidget):
         self.day_cells = {}
         first = self.current_month
         for position in range(42):
-            day = first + timedelta(days=position - first.weekday())
+            try:
+                day = first + timedelta(days=position - first.weekday())
+            except OverflowError:
+                cell = QWidget(self.grid_widget)
+                cell.setMinimumHeight(96)
+                cell.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+                self.grid_layout.addWidget(cell, position // 7, position % 7)
+                continue
             in_month = day.month == first.month
             cell = CalendarDayCell(
                 day,
