@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from threading import Lock
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -174,7 +175,7 @@ def _represent(path: Path, model) -> list[dict]:
     from deepface import DeepFace
 
     result = DeepFace.represent(
-        img_path=str(path),
+        img_path=BytesIO(path.read_bytes()),
         model_name="Facenet512",
         detector_backend=config["analysis"].get("detector_backend", "retinaface"),
         enforce_detection=False,

@@ -466,18 +466,24 @@ class AnalysisCoordinator(QObject):
         self.pool.start(task)
 
     def _batch_saved(self, generation: int, report) -> None:
-        for result in getattr(report, "results", ()):
-            if result.status == "error":
-                logger.error(
-                    "Analysis failed for image %s: %s",
-                    result.image_id,
-                    result.error or "DeepFace worker failed",
-                )
+        errors = [result for result in getattr(report, "results", ()) if result.status == "error"]
+        for result in errors:
+            logger.error(
+                "Analysis failed for image %s: %s",
+                result.image_id,
+                result.error or "DeepFace worker failed",
+            )
         if generation != self._generation:
             self.catalogue_changed.emit()
             return
         self.finished.emit(report)
-        self.status.emit("Analysis complete")
+        if errors:
+            self.status.emit(
+                f"Analysis complete with {len(errors)} error(s): "
+                f"{errors[0].error or 'DeepFace worker failed'}"
+            )
+        else:
+            self.status.emit("Analysis complete")
 
     def _persist_error(self, generation: int, message: str) -> None:
         logger.error("Analysis persistence callback failed for %s: %s", self._root, message)

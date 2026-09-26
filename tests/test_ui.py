@@ -223,12 +223,15 @@ def test_analysis_coordinator_logs_per_image_worker_errors(application, caplog):
 
     coordinator = AnalysisCoordinator(QThreadPool())
     coordinator._generation = 1
+    statuses = []
+    coordinator.status.connect(statuses.append)
 
     with caplog.at_level("ERROR"):
         coordinator._batch_saved(1, Report())
 
     assert "image 42" in caplog.text
     assert "unsupported DeepFace.represent argument" in caplog.text
+    assert statuses == ["Analysis complete with 1 error(s): TypeError: unsupported DeepFace.represent argument"]
 
 
 def test_analysis_coordinator_fails_on_unmatched_single_image_response(application):

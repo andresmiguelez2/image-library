@@ -1,5 +1,5 @@
 from datetime import datetime
-from io import StringIO
+from io import BytesIO, StringIO
 import json
 from pathlib import Path
 import sys
@@ -443,7 +443,7 @@ def test_deepface_worker_redirects_model_output_and_returns_errors(capsys):
     assert "DeepFace representer noise" in stderr
 
 
-def test_deepface_worker_default_representer_matches_installed_api(monkeypatch):
+def test_deepface_worker_default_representer_matches_installed_api(tmp_path, monkeypatch):
     calls = []
 
     class DeepFace:
@@ -461,24 +461,23 @@ def test_deepface_worker_default_representer_matches_installed_api(monkeypatch):
 
     from imagelib.services import deepface_worker
 
+    image_path = tmp_path / "foto-ñ.jpg"
+    image_path.write_bytes(b"fixture")
     fake_deepface = ModuleType("deepface")
     fake_deepface.DeepFace = DeepFace
     monkeypatch.setitem(sys.modules, "deepface", fake_deepface)
 
-    result = deepface_worker._default_representer("photo.jpg", object())
+    result = deepface_worker._default_representer(str(image_path), object())
 
     assert result == [{"embedding": [0.1] * 512}]
-    assert calls == [
-        {
-            "img_path": "photo.jpg",
-            "model_name": "Facenet512",
-            "detector_backend": deepface_worker.config["analysis"].get("detector_backend", "retinaface"),
-            "enforce_detection": False,
-        }
-    ]
+    assert isinstance(calls[0]["img_path"], BytesIO)
+    assert calls[0]["img_path"].read() == b"fixture"
+    assert calls[0]["model_name"] == "Facenet512"
+    assert calls[0]["detector_backend"] == deepface_worker.config["analysis"].get("detector_backend", "retinaface")
+    assert calls[0]["enforce_detection"] is False
 
 
-def test_deepface_worker_uses_configured_detector(monkeypatch):
+def test_deepface_worker_uses_configured_detector(tmp_path, monkeypatch):
     calls = []
 
     class DeepFace:
@@ -493,6 +492,8 @@ def test_deepface_worker_uses_configured_detector(monkeypatch):
     fake_deepface = ModuleType("deepface")
     fake_deepface.DeepFace = DeepFace
     monkeypatch.setitem(sys.modules, "deepface", fake_deepface)
-    deepface_worker._default_representer("photo.jpg", object())
+    image_path = tmp_path / "photo.jpg"
+    image_path.write_bytes(b"fixture")
+    deepface_worker._default_representer(str(image_path), object())
 
     assert calls[0]["detector_backend"] == "opencv"

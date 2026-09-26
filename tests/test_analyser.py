@@ -1,3 +1,4 @@
+from io import BytesIO
 from pathlib import Path
 
 from sqlalchemy import create_engine, select
@@ -56,7 +57,8 @@ def test_analyser_reuses_model_and_persists_faces(tmp_path: Path, monkeypatch) -
 def test_represent_matches_installed_deepface_api(tmp_path: Path, monkeypatch) -> None:
     from deepface import DeepFace
 
-    image_path = tmp_path / "photo.jpg"
+    image_path = tmp_path / "foto-ñ.jpg"
+    image_path.write_bytes(b"fixture")
     calls = []
 
     def represent(*, img_path, model_name, detector_backend, enforce_detection):
@@ -75,14 +77,11 @@ def test_represent_matches_installed_deepface_api(tmp_path: Path, monkeypatch) -
     result = analyser._represent(image_path, object())
 
     assert result == [{"embedding": [0.1] * 512}]
-    assert calls == [
-        {
-            "img_path": str(image_path),
-            "model_name": "Facenet512",
-            "detector_backend": analyser.config["analysis"].get("detector_backend", "retinaface"),
-            "enforce_detection": False,
-        }
-    ]
+    assert isinstance(calls[0]["img_path"], BytesIO)
+    assert calls[0]["img_path"].read() == b"fixture"
+    assert calls[0]["model_name"] == "Facenet512"
+    assert calls[0]["detector_backend"] == analyser.config["analysis"].get("detector_backend", "retinaface")
+    assert calls[0]["enforce_detection"] is False
 
 
 def _analysis_database(tmp_path: Path, count: int):

@@ -18,6 +18,7 @@ import json
 import subprocess
 import sys
 from contextlib import redirect_stdout
+from io import BytesIO
 from pathlib import Path
 from typing import IO, Callable
 
@@ -34,7 +35,7 @@ def _default_representer(path: str, model):
     from deepface import DeepFace
 
     result = DeepFace.represent(
-        img_path=path,
+        img_path=BytesIO(Path(path).read_bytes()),
         model_name="Facenet512",
         detector_backend=config.get("analysis", {}).get("detector_backend", "retinaface"),
         enforce_detection=False,
