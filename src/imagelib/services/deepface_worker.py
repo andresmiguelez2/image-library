@@ -36,7 +36,6 @@ def _default_representer(path: str, model):
     result = DeepFace.represent(
         img_path=path,
         model_name="Facenet512",
-        model=model,
         detector_backend=config.get("analysis", {}).get("detector_backend", "retinaface"),
         enforce_detection=False,
     )

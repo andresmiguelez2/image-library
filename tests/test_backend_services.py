@@ -393,7 +393,11 @@ def test_process_batch_rebuild_api_uses_fake_faces_without_deepface(tmp_path):
 
 
 def test_deepface_worker_loads_model_once():
-    input_stream = StringIO('{"op":"analyse","path":"one.jpg"}\n{"op":"analyse","path":"two.jpg"}\n{"op":"shutdown"}\n')
+    input_stream = StringIO(
+        '{"op":"analyse","path":"one.jpg","request_id":"one"}\n'
+        '{"op":"analyse","path":"two.jpg","request_id":"two"}\n'
+        '{"op":"shutdown","request_id":"stop"}\n'
+    )
     output_stream = StringIO()
     models = []
 
@@ -410,9 +414,10 @@ def test_deepface_worker_loads_model_once():
     )
 
     lines = [line for line in output_stream.getvalue().splitlines()]
+    responses = [json.loads(line) for line in lines]
     assert len(models) == 1
-    assert '"ok": true' in lines[0]
-    assert '"ok": true' in lines[1]
+    assert [response["request_id"] for response in responses] == ["one", "two", "stop"]
+    assert all(response["ok"] for response in responses)
 
 
 def test_deepface_worker_redirects_model_output_and_returns_errors(capsys):
@@ -436,6 +441,41 @@ def test_deepface_worker_redirects_model_output_and_returns_errors(capsys):
     stderr = capsys.readouterr().err
     assert "TensorFlow startup noise" in stderr
     assert "DeepFace representer noise" in stderr
+
+
+def test_deepface_worker_default_representer_matches_installed_api(monkeypatch):
+    calls = []
+
+    class DeepFace:
+        @staticmethod
+        def represent(*, img_path, model_name, detector_backend, enforce_detection):
+            calls.append(
+                {
+                    "img_path": img_path,
+                    "model_name": model_name,
+                    "detector_backend": detector_backend,
+                    "enforce_detection": enforce_detection,
+                }
+            )
+            return {"embedding": [0.1] * 512}
+
+    from imagelib.services import deepface_worker
+
+    fake_deepface = ModuleType("deepface")
+    fake_deepface.DeepFace = DeepFace
+    monkeypatch.setitem(sys.modules, "deepface", fake_deepface)
+
+    result = deepface_worker._default_representer("photo.jpg", object())
+
+    assert result == [{"embedding": [0.1] * 512}]
+    assert calls == [
+        {
+            "img_path": "photo.jpg",
+            "model_name": "Facenet512",
+            "detector_backend": deepface_worker.config["analysis"].get("detector_backend", "retinaface"),
+            "enforce_detection": False,
+        }
+    ]
 
 
 def test_deepface_worker_uses_configured_detector(monkeypatch):

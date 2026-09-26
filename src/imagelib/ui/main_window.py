@@ -466,6 +466,13 @@ class AnalysisCoordinator(QObject):
         self.pool.start(task)
 
     def _batch_saved(self, generation: int, report) -> None:
+        for result in getattr(report, "results", ()):
+            if result.status == "error":
+                logger.error(
+                    "Analysis failed for image %s: %s",
+                    result.image_id,
+                    result.error or "DeepFace worker failed",
+                )
         if generation != self._generation:
             self.catalogue_changed.emit()
             return

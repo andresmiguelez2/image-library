@@ -212,6 +212,25 @@ def test_cancelled_analysis_refreshes_after_late_persistence(application):
     assert changed == [True]
 
 
+def test_analysis_coordinator_logs_per_image_worker_errors(application, caplog):
+    class Result:
+        image_id = 42
+        status = "error"
+        error = "TypeError: unsupported DeepFace.represent argument"
+
+    class Report:
+        results = (Result(),)
+
+    coordinator = AnalysisCoordinator(QThreadPool())
+    coordinator._generation = 1
+
+    with caplog.at_level("ERROR"):
+        coordinator._batch_saved(1, Report())
+
+    assert "image 42" in caplog.text
+    assert "unsupported DeepFace.represent argument" in caplog.text
+
+
 def test_analysis_coordinator_fails_on_unmatched_single_image_response(application):
     class Process:
         def __init__(self):
