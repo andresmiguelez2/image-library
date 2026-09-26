@@ -886,6 +886,7 @@ class MainWindow(QMainWindow):
     def _analyse_selected(self) -> None:
         view = self.calendar if self.calendar_stack.currentIndex() == 1 else self.browser.view
         image_ids = view.selected_image_ids()
+        logger.info(f'Analysing images {image_ids}')
         if not image_ids:
             self._set_status("Select one or more images first")
             return
