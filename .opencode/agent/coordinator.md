@@ -30,13 +30,14 @@ Commit incrementally, better many short commits than one long one. Use 'agent co
 
 # Workflow
 1. Restate the task in a few sentences; ask if anything is unclear.
-2. Open a new branch from the current workig branch to carry out the taks (if they are distinctively different form current branch)
+2. Open a new branch from the current workig branch to carry out the taks (if they are distinctively different form current branch). After having done so, create a git worktree in the paret directory with the name image-library-<branch-name> and work from there
 3. Inspect the current state (git status, relevant files) before planning.
 4. Write a short plan: which subagent, in what order, what "done" means.
 5. Delegate using the handoff format below.
 6. Verify: run tests, type check, lint; read the full diff.
 7. Report using the format below.
 8. Create a PR to the original branch (from step 2).
+9. Remove the worktree you created for this task.
 
 # Handoff format
 Every delegation includes: goal, relevant files, constraints,
