@@ -14,6 +14,7 @@ from PySide6.QtCore import (
     QObject,
     QProcess,
     QProcessEnvironment,
+    QRect,
     QThreadPool,
     QTimer,
     Qt,
@@ -98,6 +99,35 @@ class FaceImageWidget(QWidget):
         self._visualise = enabled
         self.update()
 
+    def _display_rect(self) -> QRect:
+        target = self._pixmap.scaled(
+            self.rect().adjusted(8, 8, -8, -8).size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        return QRect(
+            (self.width() - target.width()) // 2,
+            (self.height() - target.height()) // 2,
+            target.width(),
+            target.height(),
+        )
+
+    def face_rects(self) -> tuple[QRect, ...]:
+        if self._pixmap.isNull():
+            return ()
+        target = self._display_rect()
+        scale_x = target.width() / self._pixmap.width()
+        scale_y = target.height() / self._pixmap.height()
+        return tuple(
+            QRect(
+                round(target.left() + face.x * scale_x),
+                round(target.top() + face.y * scale_y),
+                max(1, round(face.w * scale_x)),
+                max(1, round(face.h * scale_y)),
+            )
+            for face in self._faces
+        )
+
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor("#111418"))
@@ -105,26 +135,16 @@ class FaceImageWidget(QWidget):
             painter.setPen(QColor("#9aa5b1"))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Image unavailable")
             return
-        target = self._pixmap.scaled(
-            self.rect().adjusted(8, 8, -8, -8).size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        x = (self.width() - target.width()) // 2
-        y = (self.height() - target.height()) // 2
-        painter.drawPixmap(x, y, target)
+        target = self._display_rect()
+        painter.drawPixmap(target, self._pixmap.scaled(
+            target.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+        ))
         if not self._visualise:
             return
-        scale_x = target.width() / max(1, self._pixmap.width())
-        scale_y = target.height() / max(1, self._pixmap.height())
-        painter.setPen(QColor("#ffe37a"))
-        for face in self._faces:
-            painter.drawRect(
-                int(x + face.x * scale_x),
-                int(y + face.y * scale_y),
-                max(1, int(face.w * scale_x)),
-                max(1, int(face.h * scale_y)),
-            )
+        colours = (QColor("#ffe37a"), QColor("#67e8f9"), QColor("#f0a3ff"))
+        for index, rectangle in enumerate(self.face_rects()):
+            painter.setPen(colours[index % len(colours)])
+            painter.drawRect(rectangle)
 
 
 class DetailPanel(QFrame):
@@ -178,8 +198,8 @@ class DetailPanel(QFrame):
         timestamp = detail.taken_at or detail.modified_at
         date_text = timestamp.strftime("%Y-%m-%d %H:%M") if timestamp else "Unknown date"
         self.title.setText(f"{detail.relative_path}  ·  {date_text}  ·  {detail.status}")
-        self._faces = detail.faces
-        task = ImageAssetTask(detail.path, detail.faces, detail.thumb_path, self)
+        self._faces = detail.faces if detail.status == "analysed" else ()
+        task = ImageAssetTask(detail.path, self._faces, detail.thumb_path, self)
         task.signals.result.connect(lambda asset, s=serial: self._asset_ready(s, asset))
         task.signals.error.connect(lambda message, s=serial: self._asset_error(s, message))
         self.pool.start(task)

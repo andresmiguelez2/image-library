@@ -8,14 +8,14 @@ import pytest
 
 try:
     from PySide6.QtCore import QProcess, QRect, QThreadPool, Qt
-    from PySide6.QtGui import QPixmap
-    from PySide6.QtWidgets import QApplication
+    from PySide6.QtGui import QImage, QPainter, QPixmap
+    from PySide6.QtWidgets import QApplication, QStyleOptionViewItem
 except (ImportError, OSError):
     pytest.skip("Qt libraries are unavailable", allow_module_level=True)
 
 from imagelib.services.catalog import ImageListItem
-from imagelib.ui.main_window import AnalysisCoordinator, DetailPanel, MainWindow
-from imagelib.ui.models import CalendarModel, ThumbnailDelegate, ThumbnailModel
+from imagelib.ui.main_window import AnalysisCoordinator, DetailPanel, FaceImageWidget, MainWindow
+from imagelib.ui.models import CalendarModel, ThumbnailDelegate, ThumbnailModel, status_colour
 from imagelib.ui.workers import ImageAsset, ImageAssetTask
 
 
@@ -25,7 +25,7 @@ def application():
     return QApplication.instance() or QApplication([])
 
 
-def image_item(image_id: int, path: str) -> ImageListItem:
+def image_item(image_id: int, path: str, status: str = "indexed") -> ImageListItem:
     return ImageListItem(
         id=image_id,
         path=path,
@@ -37,7 +37,7 @@ def image_item(image_id: int, path: str) -> ImageListItem:
         width=10,
         height=10,
         face_count=0,
-        status="indexed",
+        status=status,
     )
 
 
@@ -57,6 +57,44 @@ def test_thumbnail_delegate_keeps_portrait_and_landscape_bounds(application):
 
     assert (portrait.width(), portrait.height()) == (64, 128)
     assert (landscape.width(), landscape.height()) == (164, 61)
+
+
+@pytest.mark.parametrize(
+    ("status", "colour"),
+    [("analysed", "#45c46b"), ("error", "#ef5350"), ("indexed", "#f0a43c"), ("pending", "#f0a43c")],
+)
+def test_thumbnail_status_colour(status, colour):
+    assert status_colour(status).name() == colour
+
+
+def test_thumbnail_delegate_paints_status_border(application):
+    model = ThumbnailModel()
+    model.set_items([image_item(1, "one.jpg", "error")])
+    model.set_pixmap(1, QPixmap(20, 20))
+    canvas = QImage(180, 172, QImage.Format.Format_ARGB32)
+    canvas.fill("#000000")
+    painter = QPainter(canvas)
+    option = QStyleOptionViewItem()
+    option.rect = QRect(0, 0, 180, 172)
+    ThumbnailDelegate().paint(painter, option, model.index(0))
+    painter.end()
+
+    assert canvas.pixelColor(27, 9) == status_colour("error")
+
+
+def test_detail_face_rectangles_preserve_letterbox_geometry(application):
+    widget = FaceImageWidget()
+    widget.resize(400, 300)
+
+    class Face:
+        x, y, w, h = 20, 30, 40, 50
+
+    widget.set_asset(QPixmap(200, 100), (Face(),))
+    rectangle = widget.face_rects()[0]
+
+    assert rectangle == QRect(46, 112, 77, 96)
+    widget.set_visualisation(False)
+    assert widget._visualise is False
 
 
 def test_calendar_model_has_date_sections_and_unknown_group(application):
