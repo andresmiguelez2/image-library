@@ -9,9 +9,10 @@ from pathlib import Path
 from typing import Iterable
 
 from sqlalchemy import or_, select
+from sqlalchemy.orm import aliased
 
 from imagelib.config import active_root
-from imagelib.db.models import IMAGE_STATUSES, Face, Image, Person
+from imagelib.db.models import IMAGE_STATUSES, Face, FaceMatchDecision, Image, Person
 from imagelib.db.session import SessionLocal
 
 
@@ -64,6 +65,35 @@ class ImageDetail:
     status: str
     error: str | None
     faces: tuple[FaceDetail, ...]
+
+
+@dataclass(frozen=True)
+class FaceMatchProposal:
+    """Pending match with stable candidate and target face/image samples."""
+
+    face_id: int
+    target_person_id: int
+    target_person_name: str
+    source_person_id: int
+    face_count: int
+    similarity: float | None
+    sample_image_id: int
+    sample_image_path: str
+    sample_thumbnail_path: str | None
+    face_x: float
+    face_y: float
+    face_w: float
+    face_h: float
+    confidence: float | None
+    target_face_id: int | None = None
+    target_sample_image_id: int | None = None
+    target_sample_image_path: str | None = None
+    target_sample_thumbnail_path: str | None = None
+    target_face_x: float | None = None
+    target_face_y: float | None = None
+    target_face_w: float | None = None
+    target_face_h: float | None = None
+    target_face_confidence: float | None = None
 
 
 def _root(root: str | Path | None) -> Path:
@@ -321,6 +351,130 @@ def get_image_detail(
                 for face, person_name in faces
             ),
         )
+
+
+def _cosine_similarity(left, right) -> float | None:
+    if left is None or right is None:
+        return None
+    left_norm = sum(float(value) * float(value) for value in left) ** 0.5
+    right_norm = sum(float(value) * float(value) for value in right) ** 0.5
+    if not left_norm or not right_norm:
+        return None
+    return sum(float(a) * float(b) for a, b in zip(left, right)) / (left_norm * right_norm)
+
+
+def list_pending_face_match_proposals(
+    *, root: str | Path | None = None, session_factory=SessionLocal
+) -> list[FaceMatchProposal]:
+    """List pending proposals grouped by their current unnamed analyser cluster.
+
+    Results are scoped to images below ``root`` (or the configured active root),
+    while ``face_count`` and ``similarity`` describe the complete current group.
+    The returned ``face_id`` is a stable in-root sample anchor accepted by the
+    analyser's accept/reject service APIs.
+    """
+    selected_root = _root(root)
+    target_alias = aliased(Person)
+    group_alias = aliased(Person)
+    target_face_alias = aliased(Face)
+    target_image_alias = aliased(Image)
+    with session_factory() as session:
+        rows = session.execute(
+            select(
+                FaceMatchDecision,
+                Face,
+                target_alias,
+                group_alias,
+                Image,
+                target_face_alias,
+                target_image_alias,
+            )
+            .join(Face, Face.id == FaceMatchDecision.face_id)
+            .join(Image, Image.id == Face.image_id)
+            .join(target_alias, target_alias.id == FaceMatchDecision.target_person_id)
+            .join(group_alias, group_alias.id == Face.person_id)
+            .outerjoin(target_face_alias, target_face_alias.id == target_alias.cover_face_id)
+            .outerjoin(target_image_alias, target_image_alias.id == target_face_alias.image_id)
+            .where(
+                FaceMatchDecision.status == "proposed",
+                target_alias.name.is_not(None),
+                group_alias.name.is_(None),
+            )
+            .order_by(target_alias.name, group_alias.id, Face.id)
+        ).all()
+        scoped: dict[
+            tuple[int, int],
+            list[tuple[Face, Person, Person, Image, Face | None, Image | None]],
+        ] = {}
+        for _, face, target, group, image, target_face, target_image in rows:
+            if not _under(Path(image.path), selected_root):
+                continue
+            scoped.setdefault((group.id, target.id), []).append(
+                (face, target, group, image, target_face, target_image)
+            )
+        if not scoped:
+            return []
+
+        group_ids = {group_id for group_id, _ in scoped}
+        group_faces: dict[int, list[Face]] = {group_id: [] for group_id in group_ids}
+        for face in session.scalars(
+            select(Face).where(Face.person_id.in_(group_ids)).order_by(Face.id)
+        ):
+            group_faces[face.person_id].append(face)
+
+        proposals = []
+        for (group_id, _), group_rows in scoped.items():
+            face, target, group, image, target_face, target_image = group_rows[0]
+            all_faces = group_faces.get(group_id, [])
+            embeddings = [member.embedding for member in all_faces if member.embedding is not None]
+            centroid = None
+            if embeddings:
+                centroid = [
+                    sum(float(embedding[index]) for embedding in embeddings) / len(embeddings)
+                    for index in range(len(embeddings[0]))
+                ]
+            sample = min(group_rows, key=lambda row: row[0].id)
+            face, target, group, image, target_face, target_image = sample
+            target_person_name = target.name
+            if target_person_name is None:
+                continue
+            proposals.append(
+                FaceMatchProposal(
+                    face_id=face.id,
+                    target_person_id=target.id,
+                    target_person_name=target_person_name,
+                    source_person_id=group.id,
+                    face_count=len(all_faces),
+                    similarity=_cosine_similarity(target.embedding, centroid),
+                    sample_image_id=image.id,
+                    sample_image_path=image.path,
+                    sample_thumbnail_path=image.thumb_path,
+                    face_x=face.x,
+                    face_y=face.y,
+                    face_w=face.w,
+                    face_h=face.h,
+                    confidence=face.confidence,
+                    target_face_id=target_face.id if target_face is not None else None,
+                    target_sample_image_id=target_image.id if target_image is not None else None,
+                    target_sample_image_path=target_image.path if target_image is not None else None,
+                    target_sample_thumbnail_path=(
+                        target_image.thumb_path if target_image is not None else None
+                    ),
+                    target_face_x=target_face.x if target_face is not None else None,
+                    target_face_y=target_face.y if target_face is not None else None,
+                    target_face_w=target_face.w if target_face is not None else None,
+                    target_face_h=target_face.h if target_face is not None else None,
+                    target_face_confidence=(
+                        target_face.confidence if target_face is not None else None
+                    ),
+                )
+            )
+        return proposals
+
+
+def pending_face_match_proposals(**kwargs) -> list[FaceMatchProposal]:
+    """Alias for :func:`list_pending_face_match_proposals`."""
+    return list_pending_face_match_proposals(**kwargs)
 
 
 def image_detail(*args, **kwargs) -> ImageDetail | None:

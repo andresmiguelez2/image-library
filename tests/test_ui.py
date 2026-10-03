@@ -7,16 +7,28 @@ from pathlib import Path
 import pytest
 
 try:
-    from PySide6.QtCore import QProcess, QRect, QThreadPool, Qt
+    from PySide6.QtCore import QProcess, QRect, Qt, QThreadPool
     from PySide6.QtGui import QImage, QPainter, QPixmap
     from PySide6.QtWidgets import QApplication, QStyleOptionViewItem
 except (ImportError, OSError):
     pytest.skip("Qt libraries are unavailable", allow_module_level=True)
 
-from imagelib.services.catalog import ImageListItem
-from imagelib.services import analyser
-from imagelib.ui.main_window import AnalysisCoordinator, CalendarView, DetailPanel, FaceImageWidget, MainWindow
-from imagelib.ui.models import CalendarModel, ThumbnailDelegate, ThumbnailModel, status_colour
+from imagelib.services import analyser, catalog
+from imagelib.services.catalog import FaceDetail, FaceMatchProposal, ImageListItem
+from imagelib.ui.main_window import (
+    AnalysisCoordinator,
+    CalendarView,
+    DetailPanel,
+    FaceImageWidget,
+    FaceMatchReviewDialog,
+    MainWindow,
+)
+from imagelib.ui.models import (
+    CalendarModel,
+    ThumbnailDelegate,
+    ThumbnailModel,
+    status_colour,
+)
 from imagelib.ui.workers import ImageAsset, ImageAssetTask
 
 
@@ -24,6 +36,11 @@ from imagelib.ui.workers import ImageAsset, ImageAssetTask
 def application():
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     return QApplication.instance() or QApplication([])
+
+
+@pytest.fixture(autouse=True)
+def no_live_proposal_queries(monkeypatch):
+    monkeypatch.setattr(catalog, "list_pending_face_match_proposals", lambda **_kwargs: [])
 
 
 def image_item(
@@ -280,10 +297,175 @@ def test_detail_face_ribbon_has_room_for_face_cards(application):
     panel.deleteLater()
 
 
-def test_main_window_smoke_without_startup_database_query(application):
+def test_grouped_unlabelled_face_card_is_accessible_and_clickable(application):
+    panel = DetailPanel(QThreadPool())
+    panel._faces = (
+        FaceDetail(10, 0, 0, 20, 20, None, 2, None),
+        FaceDetail(11, 0, 0, 20, 20, None, 3, "Ada"),
+        FaceDetail(12, 0, 0, 20, 20, None, None, None),
+    )
+    crop = QPixmap(96, 96).toImage()
+    panel._asset_ready(0, ImageAsset(QPixmap(200, 200).toImage(), (crop, crop, crop)))
+    cards = [panel.face_layout.itemAt(index).widget() for index in range(3)]
+    requested = []
+    panel.label_face_requested.connect(requested.append)
+
+    assert cards[0].accessibleName() == "Unlabelled face group. Activate to label this person"
+    assert "Label person" in cards[0].text()
+    assert cards[1].text() == "Ada"
+    assert "Label person" not in cards[1].text()
+    assert "Label person" not in cards[2].text()
+    cards[0].click()
+    cards[1].click()
+    cards[2].click()
+    assert requested == [10]
+    panel.deleteLater()
+
+
+def test_face_match_dialog_compares_named_and_candidate_samples(application):
+    proposal = FaceMatchProposal(
+        1, 2, "Ada", 3, 4, 0.91, 10, "/photos/candidate.jpg", None,
+        1, 2, 3, 4, 0.99,
+        target_face_id=5,
+        target_sample_image_id=11,
+        target_sample_image_path="/photos/ada.jpg",
+        target_face_x=5,
+        target_face_y=6,
+        target_face_w=7,
+        target_face_h=8,
+    )
+    dialog = FaceMatchReviewDialog(proposal)
+    actions = []
+    dialog.merge_requested.connect(lambda: actions.append("merge"))
+    dialog.reject_requested.connect(lambda: actions.append("reject"))
+    dialog.set_sample(True, QPixmap(32, 32))
+    dialog.set_sample(False, QPixmap(32, 32))
+
+    assert "Could this group be Ada?" in dialog.layout().itemAt(0).widget().text()
+    assert dialog.candidate_sample[1].pixmap() is not None
+    assert dialog.target_sample[1].pixmap() is not None
+    assert dialog.merge_button.text() == "Merge"
+    assert dialog.not_same_button.text() == "Not the same person"
+    dialog.merge_button.click()
+    dialog.not_same_button.click()
+    assert actions == ["merge", "reject"]
+    dialog.deleteLater()
+
+
+def test_main_window_smoke_with_startup_proposal_check(application):
     window = MainWindow()
     assert window.windowTitle() == "image-library"
     assert window.browser_button.isChecked()
+    window.close()
+
+
+class RecordingPool:
+    def __init__(self):
+        self.tasks = []
+
+    def start(self, task):
+        self.tasks.append(task)
+
+    def clear(self):
+        self.tasks.clear()
+
+
+def test_face_group_label_service_runs_in_worker_and_refreshes_name(
+    application, monkeypatch
+):
+    from imagelib.ui import main_window as ui_main_window
+
+    window = MainWindow()
+    pool = RecordingPool()
+    window.pool = pool
+    window._root_generation = 4
+    monkeypatch.setattr(ui_main_window.QInputDialog, "getText", lambda *_args: ("Ada", True))
+    calls = []
+    monkeypatch.setattr(
+        analyser,
+        "label_face_group",
+        lambda face_id, name, **kwargs: (
+            calls.append((face_id, name, kwargs["root"]))
+            or analyser.GroupLabelResult(9, name, 3)
+        ),
+    )
+
+    window._request_face_label(12)
+
+    assert calls == []
+    pool.tasks.pop(0).run()
+    assert calls == [(12, "Ada", window._root)]
+    assert "Labelled 3 face(s) as Ada" in window.detail.action_message.text()
+    assert len(pool.tasks) == 2
+    window.close()
+
+
+def test_face_group_label_service_errors_are_visible(application, monkeypatch):
+    from imagelib.ui import main_window as ui_main_window
+
+    window = MainWindow()
+    pool = RecordingPool()
+    window.pool = pool
+    window._root_generation = 2
+    monkeypatch.setattr(ui_main_window.QInputDialog, "getText", lambda *_args: ("Ada", True))
+
+    def duplicate_name(*_args, **_kwargs):
+        raise ValueError("Person name 'Ada' is already in use")
+
+    monkeypatch.setattr(analyser, "label_face_group", duplicate_name)
+    window._request_face_label(12)
+    pool.tasks.pop(0).run()
+
+    assert "Person name 'Ada' is already in use" in window.detail.action_message.text()
+    assert "Could not label face group" in window.status_label.text()
+    window.close()
+
+
+def _proposal() -> FaceMatchProposal:
+    return FaceMatchProposal(
+        31, 42, "Ada", 51, 2, 0.94, 61, "/photos/candidate.jpg", None,
+        1, 2, 3, 4, 0.99,
+        target_face_id=71,
+        target_sample_image_id=81,
+        target_sample_image_path="/photos/ada.jpg",
+        target_face_x=5,
+        target_face_y=6,
+        target_face_w=7,
+        target_face_h=8,
+    )
+
+
+@pytest.mark.parametrize("accept", [True, False])
+def test_proposal_resolution_runs_service_in_worker(application, monkeypatch, accept):
+    window = MainWindow()
+    pool = RecordingPool()
+    window.pool = pool
+    window._root_generation = 3
+    proposal = _proposal()
+    window._pending_proposals_ready(window._proposal_query_serial, 3, [proposal])
+    dialog = window._proposal_dialog
+    assert dialog is not None
+    calls = []
+    if accept:
+        def service(face_id, target_person_id, **kwargs):
+            calls.append(("merge", face_id, target_person_id, kwargs["root"]))
+            return analyser.GroupLabelResult(target_person_id, "Ada", 2)
+
+        monkeypatch.setattr(analyser, "accept_face_match_proposal", service)
+        dialog.merge_button.click()
+    else:
+        def service(face_id, target_person_id, **kwargs):
+            calls.append(("reject", face_id, target_person_id, kwargs["root"]))
+            return analyser.FaceMatchResolutionResult(face_id, target_person_id, "rejected", 2)
+
+        monkeypatch.setattr(analyser, "reject_face_match_proposal", service)
+        dialog.not_same_button.click()
+
+    assert calls == []
+    pool.tasks[-1].run()
+    expected = "merge" if accept else "reject"
+    assert calls == [(expected, proposal.face_id, proposal.target_person_id, window._root)]
+    assert window._proposal_dialog is None
     window.close()
 
 
