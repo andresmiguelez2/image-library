@@ -77,7 +77,9 @@ def test_thumbnail_status_colour(status, colour):
 def test_thumbnail_delegate_paints_status_border(application):
     model = ThumbnailModel()
     model.set_items([image_item(1, "one.jpg", "error")])
-    model.set_pixmap(1, QPixmap(20, 20))
+    pixmap = QPixmap(20, 20)
+    pixmap.fill("#112233")
+    model.set_pixmap(1, pixmap)
     canvas = QImage(180, 172, QImage.Format.Format_ARGB32)
     canvas.fill("#000000")
     painter = QPainter(canvas)
@@ -86,7 +88,21 @@ def test_thumbnail_delegate_paints_status_border(application):
     ThumbnailDelegate().paint(painter, option, model.index(0))
     painter.end()
 
-    assert canvas.pixelColor(27, 9) == status_colour("error")
+    error = status_colour("error")
+    painted = [
+        (x, y)
+        for y in range(canvas.height())
+        for x in range(canvas.width())
+        if canvas.pixelColor(x, y) == error
+    ]
+    assert painted
+    assert all(8 <= x <= 15 for x, _y in painted)
+    margin = 8
+    dot = 8
+    text_height = max(option.fontMetrics.lineSpacing(), 1)
+    text_top = option.rect.bottom() - 4 - text_height
+    centre_y = text_top + text_height // 2
+    assert canvas.pixelColor(margin + dot // 2, centre_y) == error
 
 
 def test_detail_face_rectangles_preserve_letterbox_geometry(application):
