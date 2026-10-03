@@ -114,6 +114,13 @@ def test_group_labelling_proposals_acceptance_and_rebuild_durability(tmp_path, m
     assert all(proposal.target_person_name == "Ada" for proposal in proposals)
     assert all(proposal.sample_image_path.startswith(str(root)) for proposal in proposals)
     assert all(proposal.similarity > 0.7 for proposal in proposals)
+    assert all(proposal.target_face_id == ada_faces[0] for proposal in proposals)
+    assert all(
+        proposal.target_sample_image_path == str(root / "ada-source-0.jpg")
+        for proposal in proposals
+    )
+    assert all(proposal.target_face_x == 3 and proposal.target_face_y == 4 for proposal in proposals)
+    assert all(proposal.target_face_w == 20 and proposal.target_face_h == 24 for proposal in proposals)
     assert set(_faces_person_ids(factory, candidate_b + candidate_c)).isdisjoint(
         {labelled.person_id}
     )
@@ -309,3 +316,104 @@ def test_proposal_catalog_and_mutations_are_root_scoped(tmp_path, monkeypatch):
         analyser.reject_face_match_proposal(
             outside_candidate[0], ada.person_id, root=root, session_factory=factory
         )
+
+
+def test_rebuild_splits_conflicting_accepted_identities_and_keeps_bridge_faces_unlabelled(
+    tmp_path, monkeypatch
+):
+    factory, root = _setup(tmp_path, monkeypatch)
+    ada_faces = _add_group(factory, root, "ada-source", 0)
+    beth_faces = _add_group(factory, root, "beth-source", 40)
+    analyser.rebuild_person_clusters(session_factory=factory)
+    ada = analyser.label_face_group(ada_faces[0], "Ada", root=root, session_factory=factory)
+    beth = analyser.label_face_group(beth_faces[0], "Beth", root=root, session_factory=factory)
+
+    bridge_faces = []
+    for index, angle in enumerate((8, 16, 24, 32)):
+        bridge_faces.extend(_add_group(factory, root, f"bridge-{index}", angle))
+
+    report = analyser.rebuild_person_clusters(session_factory=factory)
+
+    assert report.faces == len(ada_faces) + len(beth_faces) + len(bridge_faces)
+    assert _faces_person_ids(factory, ada_faces) == [ada.person_id] * len(ada_faces)
+    assert _faces_person_ids(factory, beth_faces) == [beth.person_id] * len(beth_faces)
+    bridge_person_ids = set(_faces_person_ids(factory, bridge_faces))
+    assert len(bridge_person_ids) == 1
+    assert bridge_person_ids.isdisjoint({ada.person_id, beth.person_id})
+    assert _person_for_face(factory, bridge_faces[0]).name is None
+
+    proposals = catalog.list_pending_face_match_proposals(root=root, session_factory=factory)
+    bridge_proposals = [proposal for proposal in proposals if proposal.face_id in bridge_faces]
+    assert {proposal.target_person_id for proposal in bridge_proposals} == {
+        ada.person_id,
+        beth.person_id,
+    }
+    assert all(proposal.face_count == len(bridge_faces) for proposal in bridge_proposals)
+
+    analyser.rebuild_person_clusters(session_factory=factory)
+    assert _faces_person_ids(factory, ada_faces) == [ada.person_id] * len(ada_faces)
+    assert _faces_person_ids(factory, beth_faces) == [beth.person_id] * len(beth_faces)
+    assert set(_faces_person_ids(factory, bridge_faces)).isdisjoint({ada.person_id, beth.person_id})
+
+
+def test_rebuild_preserves_accepted_faces_when_same_target_is_rejected_in_component(
+    tmp_path, monkeypatch
+):
+    factory, root = _setup(tmp_path, monkeypatch)
+    accepted_faces = _add_group(factory, root, "accepted-ada", 0)
+    rejected_faces = _add_group(factory, root, "rejected-ada", 40)
+    analyser.rebuild_person_clusters(session_factory=factory)
+    ada = analyser.label_face_group(
+        accepted_faces[0], "Ada", root=root, session_factory=factory
+    )
+    analyser.rebuild_person_clusters(session_factory=factory)
+    proposal = next(
+        proposal
+        for proposal in catalog.list_pending_face_match_proposals(root=root, session_factory=factory)
+        if proposal.face_id in rejected_faces and proposal.target_person_id == ada.person_id
+    )
+    analyser.reject_face_match_proposal(
+        proposal.face_id, ada.person_id, root=root, session_factory=factory
+    )
+
+    bridge_faces = []
+    for index, angle in enumerate((8, 16, 24, 32)):
+        bridge_faces.extend(_add_group(factory, root, f"rejected-bridge-{index}", angle))
+
+    analyser.rebuild_person_clusters(session_factory=factory)
+
+    assert _faces_person_ids(factory, accepted_faces) == [ada.person_id] * len(accepted_faces)
+    rejected_person_ids = set(_faces_person_ids(factory, rejected_faces))
+    assert len(rejected_person_ids) == 1
+    assert rejected_person_ids.isdisjoint({ada.person_id})
+    assert all(_person_for_face(factory, face_id).name is None for face_id in rejected_faces)
+    assert set(_faces_person_ids(factory, bridge_faces)) == rejected_person_ids
+    with factory() as session:
+        accepted_decisions = list(
+            session.scalars(
+                select(FaceMatchDecision).where(
+                    FaceMatchDecision.face_id.in_(accepted_faces),
+                    FaceMatchDecision.target_person_id == ada.person_id,
+                )
+            )
+        )
+        assert len(accepted_decisions) == len(accepted_faces)
+        assert {decision.status for decision in accepted_decisions} == {"accepted"}
+        ada_decisions = list(
+            session.scalars(
+                select(FaceMatchDecision).where(
+                    FaceMatchDecision.face_id.in_(rejected_faces + bridge_faces),
+                    FaceMatchDecision.target_person_id == ada.person_id,
+                )
+            )
+        )
+        assert all(decision.status == "rejected" for decision in ada_decisions)
+        assert {decision.face_id for decision in ada_decisions}.isdisjoint(set(bridge_faces))
+    assert all(
+        proposal.target_person_id != ada.person_id
+        for proposal in catalog.list_pending_face_match_proposals(root=root, session_factory=factory)
+    )
+
+    analyser.rebuild_person_clusters(session_factory=factory)
+    assert _faces_person_ids(factory, accepted_faces) == [ada.person_id] * len(accepted_faces)
+    assert set(_faces_person_ids(factory, rejected_faces + bridge_faces)) == rejected_person_ids

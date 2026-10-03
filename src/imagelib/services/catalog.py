@@ -69,7 +69,7 @@ class ImageDetail:
 
 @dataclass(frozen=True)
 class FaceMatchProposal:
-    """Pending match plus one stable face/image sample for a UI confirmation card."""
+    """Pending match with stable candidate and target face/image samples."""
 
     face_id: int
     target_person_id: int
@@ -85,6 +85,15 @@ class FaceMatchProposal:
     face_w: float
     face_h: float
     confidence: float | None
+    target_face_id: int | None = None
+    target_sample_image_id: int | None = None
+    target_sample_image_path: str | None = None
+    target_sample_thumbnail_path: str | None = None
+    target_face_x: float | None = None
+    target_face_y: float | None = None
+    target_face_w: float | None = None
+    target_face_h: float | None = None
+    target_face_confidence: float | None = None
 
 
 def _root(root: str | Path | None) -> Path:
@@ -367,13 +376,25 @@ def list_pending_face_match_proposals(
     selected_root = _root(root)
     target_alias = aliased(Person)
     group_alias = aliased(Person)
+    target_face_alias = aliased(Face)
+    target_image_alias = aliased(Image)
     with session_factory() as session:
         rows = session.execute(
-            select(FaceMatchDecision, Face, target_alias, group_alias, Image)
+            select(
+                FaceMatchDecision,
+                Face,
+                target_alias,
+                group_alias,
+                Image,
+                target_face_alias,
+                target_image_alias,
+            )
             .join(Face, Face.id == FaceMatchDecision.face_id)
             .join(Image, Image.id == Face.image_id)
             .join(target_alias, target_alias.id == FaceMatchDecision.target_person_id)
             .join(group_alias, group_alias.id == Face.person_id)
+            .outerjoin(target_face_alias, target_face_alias.id == target_alias.cover_face_id)
+            .outerjoin(target_image_alias, target_image_alias.id == target_face_alias.image_id)
             .where(
                 FaceMatchDecision.status == "proposed",
                 target_alias.name.is_not(None),
@@ -381,11 +402,16 @@ def list_pending_face_match_proposals(
             )
             .order_by(target_alias.name, group_alias.id, Face.id)
         ).all()
-        scoped: dict[tuple[int, int], list[tuple[Face, Person, Person, Image]]] = {}
-        for _, face, target, group, image in rows:
+        scoped: dict[
+            tuple[int, int],
+            list[tuple[Face, Person, Person, Image, Face | None, Image | None]],
+        ] = {}
+        for _, face, target, group, image, target_face, target_image in rows:
             if not _under(Path(image.path), selected_root):
                 continue
-            scoped.setdefault((group.id, target.id), []).append((face, target, group, image))
+            scoped.setdefault((group.id, target.id), []).append(
+                (face, target, group, image, target_face, target_image)
+            )
         if not scoped:
             return []
 
@@ -398,7 +424,7 @@ def list_pending_face_match_proposals(
 
         proposals = []
         for (group_id, _), group_rows in scoped.items():
-            face, target, group, image = group_rows[0]
+            face, target, group, image, target_face, target_image = group_rows[0]
             all_faces = group_faces.get(group_id, [])
             embeddings = [member.embedding for member in all_faces if member.embedding is not None]
             centroid = None
@@ -408,7 +434,7 @@ def list_pending_face_match_proposals(
                     for index in range(len(embeddings[0]))
                 ]
             sample = min(group_rows, key=lambda row: row[0].id)
-            face, target, group, image = sample
+            face, target, group, image, target_face, target_image = sample
             proposals.append(
                 FaceMatchProposal(
                     face_id=face.id,
@@ -425,6 +451,19 @@ def list_pending_face_match_proposals(
                     face_w=face.w,
                     face_h=face.h,
                     confidence=face.confidence,
+                    target_face_id=target_face.id if target_face is not None else None,
+                    target_sample_image_id=target_image.id if target_image is not None else None,
+                    target_sample_image_path=target_image.path if target_image is not None else None,
+                    target_sample_thumbnail_path=(
+                        target_image.thumb_path if target_image is not None else None
+                    ),
+                    target_face_x=target_face.x if target_face is not None else None,
+                    target_face_y=target_face.y if target_face is not None else None,
+                    target_face_w=target_face.w if target_face is not None else None,
+                    target_face_h=target_face.h if target_face is not None else None,
+                    target_face_confidence=(
+                        target_face.confidence if target_face is not None else None
+                    ),
                 )
             )
         return proposals

@@ -675,8 +675,48 @@ def reject_face_match_proposal(
         raise ValueError("The proposal could not be rejected because the group changed concurrently") from exc
 
 
+def _record_cluster_proposals(
+    session,
+    cluster_faces: Sequence[Face],
+    statuses_by_target: Mapping[int, set[str]],
+    rejected_targets: set[int],
+    named_by_id: Mapping[int, Person],
+    named_persons: Sequence[Person],
+    named_embeddings: Mapping[int, list[float] | None],
+    decisions_by_key: dict[tuple[int, int], FaceMatchDecision],
+    threshold: float,
+) -> None:
+    centroid = _centroid(cluster_faces)
+    proposed_targets = {
+        target_id
+        for target_id, statuses in statuses_by_target.items()
+        if "proposed" in statuses and target_id not in rejected_targets
+    }
+    for candidate in named_persons:
+        candidate_embedding = named_embeddings.get(candidate.id)
+        if candidate_embedding is None or candidate.id in rejected_targets:
+            continue
+        if _cosine_similarity(candidate_embedding, centroid) >= threshold:
+            proposed_targets.add(candidate.id)
+
+    for target_id in proposed_targets:
+        if target_id not in named_by_id:
+            continue
+        for face in cluster_faces:
+            key = (face.id, target_id)
+            decision = decisions_by_key.get(key)
+            if decision is None:
+                decision = FaceMatchDecision(
+                    face_id=face.id,
+                    target_person_id=target_id,
+                    status="proposed",
+                )
+                session.add(decision)
+                decisions_by_key[key] = decision
+
+
 def _rebuild_person_clusters(session) -> ClusterReport:
-    """Rebuild clusters while retaining named persons as stable identities."""
+    """Rebuild clusters, partitioning conflicting decisions around accepted face anchors."""
     named_persons = list(
         session.scalars(select(Person).where(Person.name.is_not(None)).with_for_update())
     )
@@ -735,61 +775,89 @@ def _rebuild_person_clusters(session) -> ClusterReport:
             for target_id, statuses in statuses_by_target.items()
             if "rejected" in statuses
         }
-        accepted_targets = {
+        all_accepted_targets = {
             target_id
             for target_id, statuses in statuses_by_target.items()
-            if "accepted" in statuses and target_id not in rejected_targets
-        }
-        person = None
-        if len(accepted_targets) == 1:
-            person = named_by_id.get(next(iter(accepted_targets)))
-        elif len(accepted_targets) > 1:
-            raise ValueError(
-                "A DBSCAN group contains accepted decisions for multiple named people; "
-                "resolve the conflicting labels before rebuilding clusters"
+            if (
+                "accepted" in statuses
+                and target_id in named_by_id
             )
+        }
+        needs_face_level_partition = (
+            len(all_accepted_targets) > 1
+            or bool(all_accepted_targets & rejected_targets)
+        )
+        accepted_targets = all_accepted_targets - rejected_targets
+        if needs_face_level_partition:
+            assigned_ids = set()
+            for target_id in all_accepted_targets:
+                accepted_faces = [
+                    face
+                    for face in cluster_faces
+                    if (
+                        (decision := decisions_by_key.get((face.id, target_id))) is not None
+                        and decision.status == "accepted"
+                    )
+                ]
+                if not accepted_faces:
+                    continue
+                target = named_by_id[target_id]
+                named_group_faces.setdefault(target_id, []).extend(accepted_faces)
+                for face in accepted_faces:
+                    face.person_id = target.id
+                    assigned_ids.add(face.id)
 
-        if person is None:
-            person = Person(embedding=centroid, cover_face_id=cluster_faces[0].id)
-            session.add(person)
-            session.flush()
-        else:
-            named_group_faces.setdefault(person.id, []).extend(cluster_faces)
-        for face in cluster_faces:
-            face.person_id = person.id
-
-        if len(accepted_targets) == 1 and person.name is not None:
+            ambiguous_faces = [face for face in cluster_faces if face.id not in assigned_ids]
+            if ambiguous_faces:
+                ambiguous_person = Person(
+                    embedding=_centroid(ambiguous_faces),
+                    cover_face_id=ambiguous_faces[0].id,
+                )
+                session.add(ambiguous_person)
+                session.flush()
+                for face in ambiguous_faces:
+                    face.person_id = ambiguous_person.id
+                ambiguous_ids = {face.id for face in ambiguous_faces}
+                ambiguous_statuses: dict[int, set[str]] = {}
+                for (decision_face_id, target_id), decision in decisions_by_key.items():
+                    if decision_face_id in ambiguous_ids:
+                        ambiguous_statuses.setdefault(target_id, set()).add(decision.status)
+                _record_cluster_proposals(
+                    session,
+                    ambiguous_faces,
+                    ambiguous_statuses,
+                    rejected_targets,
+                    named_by_id,
+                    named_persons,
+                    named_embeddings,
+                    decisions_by_key,
+                    threshold,
+                )
             continue
 
-        existing_proposals = {
-            target_id
-            for target_id, statuses in statuses_by_target.items()
-            if "proposed" in statuses and target_id not in rejected_targets
-        }
-        proposed_targets = set(existing_proposals)
-        for candidate in named_persons:
-            candidate_embedding = named_embeddings.get(candidate.id)
-            if candidate_embedding is None or candidate.id in rejected_targets:
-                continue
-            if _cosine_similarity(candidate_embedding, centroid) >= threshold:
-                proposed_targets.add(candidate.id)
-
-        for target_id in proposed_targets:
-            if target_id not in named_by_id:
-                continue
+        if len(accepted_targets) == 1:
+            person = named_by_id[next(iter(accepted_targets))]
+            named_group_faces.setdefault(person.id, []).extend(cluster_faces)
             for face in cluster_faces:
-                key = (face.id, target_id)
-                decision = decisions_by_key.get(key)
-                if decision is None:
-                    decision = FaceMatchDecision(
-                        face_id=face.id,
-                        target_person_id=target_id,
-                        status="proposed",
-                    )
-                    session.add(decision)
-                    decisions_by_key[key] = decision
-                elif decision.status == "proposed":
-                    continue
+                face.person_id = person.id
+            continue
+
+        person = Person(embedding=centroid, cover_face_id=cluster_faces[0].id)
+        session.add(person)
+        session.flush()
+        for face in cluster_faces:
+            face.person_id = person.id
+        _record_cluster_proposals(
+            session,
+            cluster_faces,
+            statuses_by_target,
+            rejected_targets,
+            named_by_id,
+            named_persons,
+            named_embeddings,
+            decisions_by_key,
+            threshold,
+        )
 
     for person_id, assigned_faces in named_group_faces.items():
         person = named_by_id[person_id]
