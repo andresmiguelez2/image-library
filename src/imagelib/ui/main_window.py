@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
+from collections.abc import Callable
 from datetime import date, timedelta
 from pathlib import Path
 from threading import Event
@@ -17,9 +18,9 @@ from PySide6.QtCore import (
     QProcessEnvironment,
     QRect,
     QSize,
+    Qt,
     QThreadPool,
     QTimer,
-    Qt,
     Signal,
 )
 from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPixmap
@@ -32,11 +33,11 @@ from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListView,
     QMainWindow,
-    QInputDialog,
     QPushButton,
     QRadioButton,
     QScrollArea,
@@ -61,7 +62,6 @@ from imagelib.ui.workers import (
     RootValidationTask,
     ScanTask,
 )
-
 
 logger = logging.getLogger(__name__)
 
@@ -1568,6 +1568,9 @@ class MainWindow(QMainWindow):
         generation = self._root_generation
         root = self._root
         dialog.set_busy(True)
+        function: Callable[
+            [], analyser.GroupLabelResult | analyser.FaceMatchResolutionResult
+        ]
         if accept:
             function = lambda: analyser.accept_face_match_proposal(
                 proposal.face_id, proposal.target_person_id, root=root

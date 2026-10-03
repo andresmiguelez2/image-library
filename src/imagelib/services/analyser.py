@@ -408,9 +408,14 @@ def _cosine_similarity(left, right) -> float:
 
 
 def _centroid(faces: Sequence[Face]) -> list[float]:
-    dimensions = len(faces[0].embedding)
+    if not faces:
+        raise ValueError("Cannot compute a centroid for an empty face group")
+    embeddings = [face.embedding for face in faces if face.embedding is not None]
+    if len(embeddings) != len(faces):
+        raise ValueError("Cannot compute a centroid for a face without an embedding")
+    dimensions = len(embeddings[0])
     return [
-        sum(float(face.embedding[index]) for face in faces) / len(faces)
+        sum(float(embedding[index]) for embedding in embeddings) / len(embeddings)
         for index in range(dimensions)
     ]
 

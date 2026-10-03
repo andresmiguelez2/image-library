@@ -1,4 +1,4 @@
-from math import cos, sin, radians
+from math import cos, radians, sin
 from pathlib import Path
 
 import pytest
@@ -6,8 +6,8 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from imagelib.db.models import Base, Face, FaceMatchDecision, Image, Person, Source
 from imagelib.db.maintenance import reconcile_persons
+from imagelib.db.models import Base, Face, FaceMatchDecision, Image, Person, Source
 from imagelib.services import analyser, catalog
 
 

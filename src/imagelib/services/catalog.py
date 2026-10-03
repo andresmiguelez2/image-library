@@ -435,11 +435,14 @@ def list_pending_face_match_proposals(
                 ]
             sample = min(group_rows, key=lambda row: row[0].id)
             face, target, group, image, target_face, target_image = sample
+            target_person_name = target.name
+            if target_person_name is None:
+                continue
             proposals.append(
                 FaceMatchProposal(
                     face_id=face.id,
                     target_person_id=target.id,
-                    target_person_name=target.name,
+                    target_person_name=target_person_name,
                     source_person_id=group.id,
                     face_count=len(all_faces),
                     similarity=_cosine_similarity(target.embedding, centroid),

@@ -1,5 +1,5 @@
-from pathlib import Path
 import re
+from pathlib import Path
 
 import pytest
 from sqlalchemy import create_engine, delete, inspect, select, update

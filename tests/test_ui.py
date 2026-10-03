@@ -3,12 +3,11 @@ from __future__ import annotations
 import os
 from datetime import date, datetime
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
 try:
-    from PySide6.QtCore import QProcess, QRect, QThreadPool, Qt
+    from PySide6.QtCore import QProcess, QRect, Qt, QThreadPool
     from PySide6.QtGui import QImage, QPainter, QPixmap
     from PySide6.QtWidgets import QApplication, QStyleOptionViewItem
 except (ImportError, OSError):
@@ -24,7 +23,12 @@ from imagelib.ui.main_window import (
     FaceMatchReviewDialog,
     MainWindow,
 )
-from imagelib.ui.models import CalendarModel, ThumbnailDelegate, ThumbnailModel, status_colour
+from imagelib.ui.models import (
+    CalendarModel,
+    ThumbnailDelegate,
+    ThumbnailModel,
+    status_colour,
+)
 from imagelib.ui.workers import ImageAsset, ImageAssetTask
 
 
