@@ -11,6 +11,7 @@ from threading import Event
 
 from PySide6.QtCore import (
     QAbstractItemModel,
+    QEvent,
     QModelIndex,
     QObject,
     QProcess,
@@ -22,7 +23,7 @@ from PySide6.QtCore import (
     Qt,
     Signal,
 )
-from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPixmap
+from PySide6.QtGui import QColor, QFontMetrics, QIcon, QImage, QPainter, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -42,6 +43,7 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QSplitter,
     QStackedWidget,
+    QToolBar,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -55,6 +57,227 @@ from imagelib.ui.workers import FunctionTask, ImageAsset, ImageAssetTask, RootVa
 
 
 logger = logging.getLogger(__name__)
+
+
+def _use_surface(widget: QWidget, role: QPalette.ColorRole) -> None:
+    widget.setAutoFillBackground(True)
+    widget.setBackgroundRole(role)
+
+
+def _mute_label(label: QLabel) -> None:
+    palette = label.palette()
+    palette.setColor(QPalette.ColorRole.WindowText, palette.color(QPalette.ColorRole.PlaceholderText))
+    label.setPalette(palette)
+
+
+def _section_label(text: str) -> QLabel:
+    label = QLabel(text)
+    label.setObjectName("sectionLabel")
+    font = label.font()
+    font.setBold(True)
+    label.setFont(font)
+    return label
+
+
+def _break_opportunities(text: str) -> str:
+    return (
+        text.replace("\u200b", "")
+        .replace("/", "/\u200b")
+        .replace("\\", "\\\u200b")
+        .replace("-", "-\u200b")
+        .replace("_", "_\u200b")
+    )
+
+
+def _thumb_metrics(column_width: int) -> tuple[int, int]:
+    margins = 8
+    spacing = 3
+    usable = max(0, column_width - margins)
+    button = max(1, (usable - spacing * 2) // 3)
+    icon = min(48, max(1, button - 6))
+    if icon >= button:
+        icon = max(1, button - 1)
+    return button, icon
+
+
+def _elide_two_lines(text: str, width: int, metrics: QFontMetrics) -> str:
+    if width <= 0 or metrics.horizontalAdvance(text) <= width:
+        return text
+    words = text.split(" ")
+    if len(words) <= 1:
+        return metrics.elidedText(text, Qt.TextElideMode.ElideRight, width)
+    lines: list[str] = []
+    index = 0
+    while index < len(words) and len(lines) < 2:
+        current = words[index]
+        index += 1
+        while index < len(words):
+            trial = f"{current} {words[index]}"
+            if metrics.horizontalAdvance(trial) > width:
+                break
+            current = trial
+            index += 1
+        if len(lines) == 1 and index < len(words):
+            current = metrics.elidedText(" ".join([current, *words[index:]]), Qt.TextElideMode.ElideRight, width)
+            index = len(words)
+        elif metrics.horizontalAdvance(current) > width:
+            current = metrics.elidedText(current, Qt.TextElideMode.ElideRight, width)
+        lines.append(current)
+    return "\n".join(lines)
+
+
+class ElidedLabel(QLabel):
+    def __init__(self, text: str = "", parent=None) -> None:
+        super().__init__(parent)
+        self._full_text = ""
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.set_full_text(text)
+
+    def set_full_text(self, text: str) -> None:
+        self._full_text = text
+        self.setToolTip(text)
+        self._apply_elide()
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(0, max(self.fontMetrics().lineSpacing(), 1))
+
+    def sizeHint(self) -> QSize:
+        return QSize(0, self.minimumSizeHint().height())
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._apply_elide()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._apply_elide()
+
+    def _apply_elide(self) -> None:
+        width = self.contentsRect().width()
+        if width <= 0:
+            if self.text() != self._full_text:
+                super().setText(self._full_text)
+            return
+        elided = self.fontMetrics().elidedText(self._full_text, Qt.TextElideMode.ElideMiddle, width)
+        if self.text() != elided:
+            super().setText(elided)
+
+
+class WrappingLabel(QLabel):
+    def __init__(self, text: str = "", parent=None) -> None:
+        super().__init__(parent)
+        self._full_text = ""
+        self.setWordWrap(True)
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+        self.setText(text)
+
+    def setText(self, text: str) -> None:
+        self._full_text = text
+        self.setToolTip(text)
+        super().setText(_break_opportunities(text))
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(0, self.fontMetrics().lineSpacing())
+
+    def sizeHint(self) -> QSize:
+        width = 240
+        height = self.heightForWidth(width)
+        if height < 0:
+            height = self.fontMetrics().lineSpacing()
+        return QSize(width, height)
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+
+class FaceNameLabel(QLabel):
+    def __init__(self, text: str, parent=None) -> None:
+        super().__init__(parent)
+        self._full_text = text
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setToolTip(text)
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        line = max(self.fontMetrics().lineSpacing(), 1)
+        self.setMaximumHeight(line * 2)
+        super().setText(text)
+
+    def hasHeightForWidth(self) -> bool:
+        return False
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(0, self.fontMetrics().lineSpacing())
+
+    def sizeHint(self) -> QSize:
+        return QSize(96, self.fontMetrics().lineSpacing())
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        width = max(1, self.contentsRect().width())
+        display = _elide_two_lines(self._full_text, width, self.fontMetrics())
+        if self.text() != display:
+            super().setText(display)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        width = max(1, self.contentsRect().width())
+        display = _elide_two_lines(self._full_text, width, self.fontMetrics())
+        if self.text() != display:
+            super().setText(display)
+
+
+class ButtonRowScroll(QScrollArea):
+    def __init__(self, content: QWidget, parent=None) -> None:
+        super().__init__(parent)
+        self._fitting = False
+        self.setWidget(content)
+        self.setWidgetResizable(False)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setMinimumWidth(0)
+        _use_surface(self, QPalette.ColorRole.Base)
+        self.fit()
+
+    def minimumSizeHint(self) -> QSize:
+        content = self.widget()
+        height = content.sizeHint().height() if content is not None else 0
+        return QSize(0, max(height, 1))
+
+    def sizeHint(self) -> QSize:
+        return self.minimumSizeHint()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.fit()
+
+    def fit(self) -> None:
+        if self._fitting:
+            return
+        content = self.widget()
+        if content is None:
+            return
+        self._fitting = True
+        try:
+            layout = content.layout()
+            if layout is not None:
+                layout.activate()
+            hint = content.sizeHint()
+            viewport_width = self.viewport().width()
+            overflows = viewport_width > 0 and hint.width() > viewport_width
+            bar = self.horizontalScrollBar().sizeHint().height() if overflows else 0
+            target = QSize(max(hint.width(), viewport_width), max(hint.height(), 1))
+            if content.size() != target:
+                content.resize(target)
+            fitted = target.height() + bar
+            if self.height() != fitted:
+                self.setFixedHeight(fitted)
+        finally:
+            self._fitting = False
 
 
 def _default_root() -> Path:
@@ -77,6 +300,9 @@ class CollectionView(QListView):
         self.setUniformItemSizes(True)
         self.setSelectionMode(QListView.SelectionMode.ExtendedSelection)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        _use_surface(self, QPalette.ColorRole.Base)
         self.clicked.connect(self._clicked)
 
     def _clicked(self, index: QModelIndex) -> None:
@@ -107,24 +333,36 @@ class CalendarDayCell(QFrame):
         self._buttons: dict[int, QToolButton] = {}
         self.setObjectName("calendarOutsideDay" if outside_month else "calendarDay")
         self.setProperty("outsideMonth", outside_month)
+        self.setFrameShape(QFrame.Shape.NoFrame)
         self.setMinimumHeight(96)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.setBackgroundRole(QPalette.ColorRole.Window if outside_month else QPalette.ColorRole.AlternateBase)
+        self.setAutoFillBackground(True)
+        self._thumb_button = 54
+        self._thumb_icon = 48
 
         header = QHBoxLayout()
-        header.setContentsMargins(5, 4, 5, 2)
-        header.setSpacing(4)
+        header.setContentsMargins(4, 2, 4, 0)
+        header.setSpacing(2)
         heading = QLabel(str(day.day) if day else "Unknown date")
         heading.setObjectName("calendarDayNumber")
+        heading.setMinimumWidth(0)
+        if outside_month:
+            _mute_label(heading)
         header.addWidget(heading)
         if self.items:
             count = QLabel(str(len(self.items)))
             count.setToolTip(f"{len(self.items)} image(s)")
+            count.setMinimumWidth(0)
             header.addWidget(count)
             self.select_button = QToolButton()
             self.select_button.setText("All")
             self.select_button.setToolTip("Select all images in this date")
             self.select_button.setCheckable(True)
             self.select_button.setAutoRaise(True)
+            self.select_button.setMinimumWidth(0)
+            self.select_button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
             self.select_button.clicked.connect(self._select_all)
             header.addWidget(self.select_button)
         else:
@@ -140,8 +378,8 @@ class CalendarDayCell(QFrame):
             button.setCheckable(True)
             button.setAutoRaise(True)
             button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
-            button.setIconSize(QSize(48, 48))
-            button.setFixedSize(54, 54)
+            button.setIconSize(QSize(self._thumb_icon, self._thumb_icon))
+            button.setFixedSize(self._thumb_button, self._thumb_button)
             button.setToolTip(f"{item.relative_path}\nClick to open image details")
             button.setAccessibleName(Path(item.path).name)
             button.toggled.connect(lambda _checked, b=button: self._button_toggled(b))
@@ -157,6 +395,24 @@ class CalendarDayCell(QFrame):
         layout.addLayout(header)
         layout.addLayout(self.image_layout)
         self._update_select_button()
+
+    def apply_thumb_size(self, button_size: int, icon_size: int) -> None:
+        button_size = max(1, button_size)
+        icon_size = max(1, min(icon_size, button_size))
+        if button_size == self._thumb_button and icon_size == self._thumb_icon:
+            return
+        self._thumb_button = button_size
+        self._thumb_icon = icon_size
+        for button in self._buttons.values():
+            button.setIconSize(QSize(icon_size, icon_size))
+            button.setFixedSize(button_size, button_size)
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setPen(self.palette().color(QPalette.ColorRole.Mid))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRect(self.rect().adjusted(0, 0, -1, -1))
 
     @staticmethod
     def _set_button_pixmap(button: QToolButton, pixmap: QPixmap | None) -> None:
@@ -232,22 +488,43 @@ class CalendarView(QWidget):
         self.month_label = QLabel()
         self.month_label.setObjectName("calendarMonthLabel")
         self.month_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        toolbar = QHBoxLayout()
+        self.month_label.setMinimumWidth(0)
+        month_font = self.month_label.font()
+        month_font.setBold(True)
+        self.month_label.setFont(month_font)
+        navigation = QWidget()
+        toolbar = QHBoxLayout(navigation)
+        toolbar.setContentsMargins(0, 0, 0, 0)
         toolbar.addWidget(self.previous_button)
         toolbar.addWidget(self.month_label, 1)
         toolbar.addWidget(self.month_selector)
         toolbar.addWidget(self.year_selector)
         toolbar.addWidget(self.today_button)
         toolbar.addWidget(self.next_button)
+        self.navigation_scroll = ButtonRowScroll(navigation)
 
-        weekdays = QGridLayout()
-        weekdays.setContentsMargins(3, 0, 3, 0)
-        weekdays.setSpacing(3)
-        for column, name in enumerate(("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")):
+        self.weekday_layout = QGridLayout()
+        self.weekday_layout.setContentsMargins(3, 0, 3, 0)
+        self.weekday_layout.setSpacing(3)
+        weekday_names = (
+            ("Mon", "Monday"),
+            ("Tue", "Tuesday"),
+            ("Wed", "Wednesday"),
+            ("Thu", "Thursday"),
+            ("Fri", "Friday"),
+            ("Sat", "Saturday"),
+            ("Sun", "Sunday"),
+        )
+        for column, (name, full_name) in enumerate(weekday_names):
             label = QLabel(name)
             label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             label.setObjectName("calendarWeekday")
-            weekdays.addWidget(label, 0, column)
+            label.setMinimumWidth(0)
+            label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+            label.setToolTip(full_name)
+            _mute_label(label)
+            self.weekday_layout.addWidget(label, 0, column)
+            self.weekday_layout.setColumnStretch(column, 1)
 
         self.grid_widget = QWidget()
         self.grid_layout = QGridLayout(self.grid_widget)
@@ -255,9 +532,13 @@ class CalendarView(QWidget):
         self.grid_layout.setSpacing(3)
         for column in range(7):
             self.grid_layout.setColumnStretch(column, 1)
+            self.grid_layout.setColumnMinimumWidth(column, 0)
         self.grid_scroll = QScrollArea()
         self.grid_scroll.setWidgetResizable(True)
+        self.grid_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.grid_scroll.setWidget(self.grid_widget)
+        self.grid_scroll.viewport().installEventFilter(self)
+        _use_surface(self.grid_widget, QPalette.ColorRole.Base)
 
         self.unknown_title = QLabel("Unknown date")
         self.unknown_title.setObjectName("calendarUnknownTitle")
@@ -268,9 +549,10 @@ class CalendarView(QWidget):
         self.unknown_area.setLayout(self.unknown_layout)
         self.unknown_area.setVisible(False)
 
+        _use_surface(self, QPalette.ColorRole.Base)
         layout = QVBoxLayout(self)
-        layout.addLayout(toolbar)
-        layout.addLayout(weekdays)
+        layout.addWidget(self.navigation_scroll)
+        layout.addLayout(self.weekday_layout)
         layout.addWidget(self.grid_scroll, 1)
         layout.addWidget(self.unknown_area)
 
@@ -278,6 +560,38 @@ class CalendarView(QWidget):
         self.model.pixmap_changed.connect(self.set_pixmap)
         self._sync_navigation_controls()
         self._render()
+
+    def eventFilter(self, watched, event) -> bool:
+        if watched is self.grid_scroll.viewport() and event.type() == QEvent.Type.Resize:
+            self._apply_thumb_sizes()
+        return super().eventFilter(watched, event)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._apply_thumb_sizes()
+
+    def _day_column_width(self) -> int:
+        width = self.grid_scroll.viewport().width()
+        if width <= 0:
+            return 0
+        margins = self.grid_layout.contentsMargins()
+        spacing = self.grid_layout.spacing()
+        available = width - margins.left() - margins.right() - spacing * 6
+        return max(0, available // 7)
+
+    def _apply_thumb_sizes(self) -> None:
+        column = self._day_column_width()
+        if column <= 0:
+            return
+        button_size, icon_size = _thumb_metrics(column)
+        for cell in self.day_cells.values():
+            cell.setMaximumWidth(column)
+            cell.apply_thumb_size(button_size, icon_size)
+        if self.unknown_cell is not None:
+            self.unknown_cell.apply_thumb_size(button_size, icon_size)
+        bar = self.grid_scroll.verticalScrollBar()
+        extra = bar.sizeHint().width() if bar.isVisible() else 0
+        self.weekday_layout.setContentsMargins(3, 0, 3 + extra, 0)
 
     @staticmethod
     def _first_of_month(value: date) -> date:
@@ -381,6 +695,7 @@ class CalendarView(QWidget):
             self.unknown_area.setVisible(True)
         else:
             self.unknown_area.setVisible(False)
+        self._apply_thumb_sizes()
 
     def _cell_selection_changed(self, cell: CalendarDayCell) -> None:
         cell_ids = {item.id for item in cell.items}
@@ -446,9 +761,9 @@ class FaceImageWidget(QWidget):
 
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor("#111418"))
+        painter.fillRect(self.rect(), self.palette().color(QPalette.ColorRole.Base))
         if self._pixmap.isNull():
-            painter.setPen(QColor("#9aa5b1"))
+            painter.setPen(self.palette().color(QPalette.ColorRole.Text))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Image unavailable")
             return
         target = self._display_rect()
@@ -469,11 +784,20 @@ class DetailPanel(QFrame):
         self.pool = pool
         self._serial = 0
         self._faces = ()
-        self.title = QLabel("Select an image to see details")
+        self.title = ElidedLabel("Select an image to see details")
         self.title.setObjectName("detailTitle")
+        title_font = self.title.font()
+        title_font.setBold(True)
+        self.title.setFont(title_font)
+        self.subtitle = QLabel()
+        self.subtitle.setObjectName("detailSubtitle")
+        self.subtitle.setWordWrap(True)
+        self.subtitle.setMinimumWidth(0)
+        _mute_label(self.subtitle)
         self.image = FaceImageWidget()
         self.face_scroll = QScrollArea()
         self.face_scroll.setWidgetResizable(True)
+        self.face_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.face_scroll.setMinimumHeight(152)
         self.face_scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.face_strip = QWidget()
@@ -483,15 +807,20 @@ class DetailPanel(QFrame):
         self.face_strip.setMinimumHeight(140)
         self.face_strip.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
         self.face_scroll.setWidget(self.face_strip)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        _use_surface(self, QPalette.ColorRole.Base)
         layout = QVBoxLayout(self)
         layout.addWidget(self.title)
+        layout.addWidget(self.subtitle)
         layout.addWidget(self.image, 1)
         layout.addWidget(self.face_scroll)
         self.setMinimumHeight(380)
 
     def clear(self, message: str = "Select an image to see details") -> None:
         self._serial += 1
-        self.title.setText(message)
+        self.title.set_full_text(message)
+        self.subtitle.clear()
+        self.subtitle.setToolTip("")
         self.image.set_asset(QPixmap())
         self._clear_faces()
 
@@ -513,7 +842,10 @@ class DetailPanel(QFrame):
             return
         timestamp = detail.taken_at or detail.modified_at
         date_text = timestamp.strftime("%Y-%m-%d %H:%M") if timestamp else "Unknown date"
-        self.title.setText(f"{detail.relative_path}  ·  {date_text}  ·  {detail.status}")
+        self.title.set_full_text(detail.relative_path)
+        status_text = f"{date_text}  ·  {detail.status}"
+        self.subtitle.setText(status_text)
+        self.subtitle.setToolTip(f"{detail.relative_path}  ·  {date_text}  ·  {detail.status}")
         self._faces = detail.faces if detail.status == "analysed" else ()
         task = ImageAssetTask(detail.path, self._faces, detail.thumb_path, self)
         task.signals.result.connect(lambda asset, s=serial: self._asset_ready(s, asset))
@@ -540,9 +872,8 @@ class DetailPanel(QFrame):
             else:
                 preview.setText("No crop")
             name = face.person_name or "Unknown / Unassigned"
-            label = QLabel(name)
-            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            label.setWordWrap(True)
+            label = FaceNameLabel(name)
+            card.setFixedWidth(120)
             card_layout.addWidget(preview)
             card_layout.addWidget(label)
             self.face_layout.addWidget(card)
@@ -551,7 +882,9 @@ class DetailPanel(QFrame):
         if serial == self._serial:
             logger.error("Could not load detail image: %s", message)
             self.image.set_asset(QPixmap())
-            self.title.setText(f"Could not load image: {message}")
+            self.title.set_full_text("Could not load image")
+            self.subtitle.setText(message)
+            self.subtitle.setToolTip(message)
 
 
 class BrowserView(QWidget):
@@ -575,9 +908,12 @@ class BrowserView(QWidget):
         self.folder_layout = QHBoxLayout(self.folder_row)
         self.folder_layout.setContentsMargins(0, 0, 0, 0)
         self.folder_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        self.breadcrumb_scroll = ButtonRowScroll(self.breadcrumbs)
+        self.folder_scroll = ButtonRowScroll(self.folder_row)
+        _use_surface(self, QPalette.ColorRole.Base)
         layout = QVBoxLayout(self)
-        layout.addWidget(self.breadcrumbs)
-        layout.addWidget(self.folder_row)
+        layout.addWidget(self.breadcrumb_scroll)
+        layout.addWidget(self.folder_scroll)
         layout.addWidget(self.view, 1)
 
     def set_root(self, root: Path) -> None:
@@ -596,15 +932,19 @@ class BrowserView(QWidget):
             child = self.breadcrumb_layout.takeAt(0)
             if child.widget() is not None:
                 child.widget().deleteLater()
-        root_button = QPushButton(self.root.name or str(self.root))
+        root_name = self.root.name or str(self.root)
+        root_button = QPushButton(root_name)
+        root_button.setToolTip(str(self.root) if self.root else root_name)
         root_button.clicked.connect(lambda: self.directory_changed.emit(Path()))
         self.breadcrumb_layout.addWidget(root_button)
         for index, part in enumerate(directory.parts):
             self.breadcrumb_layout.addWidget(QLabel("›"))
             button = QPushButton(part)
+            button.setToolTip(part)
             button.clicked.connect(lambda _checked=False, i=index: self.directory_changed.emit(Path(*directory.parts[: i + 1])))
             self.breadcrumb_layout.addWidget(button)
         self.breadcrumb_layout.addStretch(1)
+        self.breadcrumb_scroll.fit()
         self._render_folders()
 
     def _render_folders(self) -> None:
@@ -622,9 +962,11 @@ class BrowserView(QWidget):
             self.folder_layout.addWidget(QLabel("Folders:"))
             for folder in sorted(folders):
                 button = QPushButton(folder)
+                button.setToolTip(folder)
                 button.clicked.connect(lambda _checked=False, name=folder: self.directory_changed.emit(self.directory / name))
                 self.folder_layout.addWidget(button)
         self.folder_layout.addStretch(1)
+        self.folder_scroll.fit()
 
     def selected_image_ids(self) -> list[int]:
         return self.view.selected_image_ids()
@@ -914,6 +1256,7 @@ class MainWindow(QMainWindow):
         self._validation_serial = 0
         self._detail_serial = 0
         self._browser_serial = 0
+        self._splitters_sized = False
         self._build_ui()
         self.analysis = AnalysisCoordinator(self.pool, self)
         self.analysis.status.connect(self._set_status)
@@ -924,6 +1267,7 @@ class MainWindow(QMainWindow):
     def _build_ui(self) -> None:
         self.root_input = QLineEdit(str(self._root))
         self.root_input.setPlaceholderText("Image library root")
+        self.root_input.setMinimumWidth(0)
         self.root_input.returnPressed.connect(self._confirm_root)
         choose = QPushButton("Choose…")
         choose.clicked.connect(self._choose_root)
@@ -931,16 +1275,22 @@ class MainWindow(QMainWindow):
         root_row.addWidget(self.root_input, 1)
         root_row.addWidget(choose)
 
-        self.active_root_label = QLabel(f"Active root: {self._root}")
-        self.active_root_label.setWordWrap(True)
-        self.status_label = QLabel("Ready. Confirm a root to begin scanning.")
-        self.status_label.setWordWrap(True)
-        self.count_label = QLabel("Total 0 · Analysed 0 · Not analysed 0 · Errors 0")
-        self.count_label.setWordWrap(True)
-        self.calendar_button = QRadioButton("Calendar")
-        self.browser_button = QRadioButton("Browser")
+        self.active_root_label = WrappingLabel(f"Active root: {self._root}")
+        self.total_label = QLabel("Total 0")
+        self.analysed_label = QLabel("Analysed 0")
+        self.not_analysed_label = QLabel("Not analysed 0")
+        self.errors_label = QLabel("Errors 0")
+        view_switch = QWidget()
+        self.browser_button = QRadioButton("Browser", view_switch)
+        self.calendar_button = QRadioButton("Calendar", view_switch)
         self.browser_button.setChecked(True)
         self.calendar_button.toggled.connect(self._switch_view)
+        view_layout = QHBoxLayout(view_switch)
+        view_layout.setContentsMargins(4, 0, 4, 0)
+        view_layout.setSpacing(8)
+        view_layout.addWidget(self.browser_button)
+        view_layout.addWidget(self.calendar_button)
+        view_switch.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
         self.visualise = QCheckBox("Show face rectangles on detail")
         self.visualise.toggled.connect(self._visualisation_changed)
         self.analyse_selected_button = QPushButton("Analyse selected")
@@ -951,24 +1301,35 @@ class MainWindow(QMainWindow):
         self.cancel_button.clicked.connect(self.analysis_cancelled)
         self.cancel_button.setEnabled(False)
 
+        toolbar = QToolBar()
+        toolbar.setObjectName("mainToolBar")
+        toolbar.setMovable(False)
+        toolbar.setFloatable(False)
+        toolbar.setContextMenuPolicy(Qt.ContextMenuPolicy.PreventContextMenu)
+        toolbar.addWidget(view_switch)
+        toolbar.addSeparator()
+        toolbar.addWidget(self.analyse_selected_button)
+        toolbar.addWidget(self.analyse_all_button)
+        toolbar.addWidget(self.cancel_button)
+        self.addToolBar(toolbar)
+
         sidebar = QWidget()
         sidebar.setObjectName("sidebar")
-        sidebar.setMinimumWidth(260)
+        sidebar.setMinimumWidth(240)
+        sidebar.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        _use_surface(sidebar, QPalette.ColorRole.Window)
         sidebar_layout = QVBoxLayout(sidebar)
-        sidebar_layout.addWidget(QLabel("Library root"))
+        sidebar_layout.addWidget(_section_label("Library"))
         sidebar_layout.addLayout(root_row)
         sidebar_layout.addWidget(self.active_root_label)
-        sidebar_layout.addWidget(self.status_label)
-        sidebar_layout.addWidget(self.count_label)
-        sidebar_layout.addSpacing(12)
-        sidebar_layout.addWidget(QLabel("View"))
-        sidebar_layout.addWidget(self.browser_button)
-        sidebar_layout.addWidget(self.calendar_button)
-        sidebar_layout.addSpacing(12)
+        sidebar_layout.addSpacing(16)
+        sidebar_layout.addWidget(_section_label("Catalogue"))
+        sidebar_layout.addWidget(self.total_label)
+        sidebar_layout.addWidget(self.analysed_label)
+        sidebar_layout.addWidget(self.not_analysed_label)
+        sidebar_layout.addWidget(self.errors_label)
+        sidebar_layout.addSpacing(8)
         sidebar_layout.addWidget(self.visualise)
-        sidebar_layout.addWidget(self.analyse_selected_button)
-        sidebar_layout.addWidget(self.analyse_all_button)
-        sidebar_layout.addWidget(self.cancel_button)
         sidebar_layout.addStretch(1)
 
         self.browser = BrowserView(self.pool, self)
@@ -980,23 +1341,44 @@ class MainWindow(QMainWindow):
         self.calendar_stack = QStackedWidget()
         self.calendar_stack.addWidget(self.browser)
         self.calendar_stack.addWidget(self.calendar)
+        self.calendar_stack.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        _use_surface(self.calendar_stack, QPalette.ColorRole.Base)
         self.detail = DetailPanel(self.pool, self)
+        self.detail.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         central_splitter = QSplitter(Qt.Orientation.Vertical)
         central_splitter.addWidget(self.calendar_stack)
         central_splitter.addWidget(self.detail)
         central_splitter.setStretchFactor(0, 3)
         central_splitter.setStretchFactor(1, 2)
+        central_splitter.setCollapsible(0, False)
+        central_splitter.setCollapsible(1, False)
+        central_splitter.setHandleWidth(8)
+        central_splitter.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        _use_surface(central_splitter, QPalette.ColorRole.Base)
 
-        content = QWidget()
-        content_layout = QHBoxLayout(content)
-        content_layout.addWidget(sidebar)
-        content_layout.addWidget(central_splitter, 1)
-        self.setCentralWidget(content)
-        self.statusBar().showMessage("Ready")
+        self.content_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.content_splitter.addWidget(sidebar)
+        self.content_splitter.addWidget(central_splitter)
+        self.content_splitter.setStretchFactor(0, 0)
+        self.content_splitter.setStretchFactor(1, 1)
+        self.content_splitter.setCollapsible(0, False)
+        self.content_splitter.setCollapsible(1, False)
+        self.content_splitter.setHandleWidth(8)
+        self.content_splitter.setSizes([280, 1000])
+        self.setCentralWidget(self.content_splitter)
+        self.statusBar().showMessage("Ready. Confirm a root to begin scanning.")
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if not self._splitters_sized:
+            self._splitters_sized = True
+            sidebar_width = 280
+            self.content_splitter.setSizes([sidebar_width, max(1, self.width() - sidebar_width)])
 
     def _set_status(self, message: str) -> None:
-        self.status_label.setText(message)
-        self.statusBar().showMessage(message)
+        bar = self.statusBar()
+        bar.showMessage(message)
+        bar.setToolTip(message)
 
     def _choose_root(self) -> None:
         selected = QFileDialog.getExistingDirectory(self, "Choose image root", str(self._root))
@@ -1097,9 +1479,10 @@ class MainWindow(QMainWindow):
         counts, browser_items, groups, all_browser_items = snapshot
         total = sum(counts.values())
         not_analysed = counts.get("indexed", 0) + counts.get("pending", 0)
-        self.count_label.setText(
-            f"Total {total} · Analysed {counts.get('analysed', 0)} · Not analysed {not_analysed} · Errors {counts.get('error', 0)}"
-        )
+        self.total_label.setText(f"Total {total}")
+        self.analysed_label.setText(f"Analysed {counts.get('analysed', 0)}")
+        self.not_analysed_label.setText(f"Not analysed {not_analysed}")
+        self.errors_label.setText(f"Errors {counts.get('error', 0)}")
         self.browser.set_catalog_items(all_browser_items)
         if browser_serial == self._browser_serial and directory == self.browser.directory:
             self.browser.model.set_items(browser_items)

@@ -6,7 +6,7 @@ from datetime import date
 from pathlib import Path
 
 from PySide6.QtCore import QAbstractListModel, QModelIndex, QRect, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QPainter, QPixmap
+from PySide6.QtGui import QColor, QPainter, QPalette, QPixmap
 from PySide6.QtWidgets import QStyle, QStyleOptionViewItem, QStyledItemDelegate
 
 from imagelib.services.catalog import ImageListItem
@@ -80,24 +80,56 @@ class ThumbnailDelegate(QStyledItemDelegate):
 
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
         painter.save()
+        painter.setFont(option.font)
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
-        painter.fillRect(option.rect, QColor("#2b3e55" if selected else "#20252b"))
+        palette = option.palette
+        background = palette.color(QPalette.ColorRole.Highlight if selected else QPalette.ColorRole.Base)
+        painter.fillRect(option.rect, background)
+        text_colour = palette.color(
+            QPalette.ColorRole.HighlightedText if selected else QPalette.ColorRole.Text
+        )
+        metrics = option.fontMetrics
+        margin = 8
+        dot = 8
+        gap = 6
+        text_height = max(metrics.lineSpacing(), 1)
+        text_band = max(text_height, dot) + 8
+        image_rect = option.rect.adjusted(margin, margin, -margin, -text_band)
+        if image_rect.width() < 1 or image_rect.height() < 1:
+            image_rect = option.rect.adjusted(margin, margin, -margin, -margin)
         pixmap = index.data(Qt.ItemDataRole.DecorationRole)
-        image_rect = option.rect.adjusted(8, 8, -8, -36)
         if isinstance(pixmap, QPixmap) and not pixmap.isNull():
-            scaled = pixmap.scaled(image_rect.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            scaled = pixmap.scaled(
+                image_rect.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
             target = self._pixmap_rect(image_rect, pixmap)
             painter.drawPixmap(target, scaled)
         else:
-            painter.fillRect(image_rect, QColor("#15181c"))
+            painter.fillRect(image_rect, palette.color(QPalette.ColorRole.AlternateBase))
+            painter.setPen(text_colour)
             painter.drawText(image_rect, Qt.AlignmentFlag.AlignCenter, "Loading…")
-            target = image_rect
+        text_width = max(1, option.rect.width() - margin * 2 - dot - gap)
+        text_top = option.rect.bottom() - 4 - text_height
+        text_rect = QRect(option.rect.left() + margin + dot + gap, text_top, text_width, text_height)
+        name = index.data() or ""
+        elided = metrics.elidedText(str(name), Qt.TextElideMode.ElideRight, text_rect.width())
+        painter.setPen(text_colour)
+        painter.drawText(text_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, elided)
+        dot_rect = QRect(option.rect.left() + margin, text_rect.center().y() - dot // 2, dot, dot)
         item = index.data(Qt.ItemDataRole.UserRole)
-        painter.setPen(QColor(status_colour(getattr(item, "status", None))))
-        painter.drawRect(target.adjusted(1, 1, -2, -2))
-        text_rect = option.rect.adjusted(8, option.rect.height() - 28, -8, -6)
-        painter.setPen(QColor("#edf1f5"))
-        painter.drawText(text_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, index.data())
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(status_colour(getattr(item, "status", None)))
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        painter.drawEllipse(dot_rect)
+        if option.state & QStyle.StateFlag.State_HasFocus:
+            focus_colour = palette.color(
+                QPalette.ColorRole.HighlightedText if selected else QPalette.ColorRole.Highlight
+            )
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(focus_colour)
+            painter.drawRect(option.rect.adjusted(1, 1, -2, -2))
         painter.restore()
 
     def sizeHint(self, option, index) -> QSize:

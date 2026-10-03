@@ -2,6 +2,7 @@
 
 import logging
 
+from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QApplication
 
 from imagelib import __version__
@@ -9,22 +10,37 @@ from imagelib.diagnostics import diagnostic
 from imagelib.ui.main_window import MainWindow
 
 
-STYLE = """
-QMainWindow, QWidget { background: #181b1f; color: #edf1f5; }
-QLineEdit, QComboBox, QSpinBox, QScrollArea, QListView { background: #20252b; border: 1px solid #3c4652; border-radius: 4px; color: #edf1f5; }
-QPushButton { background: #2f3b49; border: 1px solid #536273; border-radius: 4px; padding: 6px 10px; }
-QPushButton:hover { background: #405267; }
-QToolButton { background: #2f3b49; border: 1px solid #536273; border-radius: 4px; padding: 2px; }
-QToolButton:hover { background: #405267; }
-QToolButton:checked { background: #2b3e55; border-color: #8ec5ff; }
-QPushButton:checked, QRadioButton:checked { color: #8ec5ff; }
-QLabel#detailTitle { font-weight: bold; padding: 4px; }
-QLabel#calendarMonthLabel { font-size: 16px; font-weight: bold; }
-QFrame#calendarDay, QFrame#calendarOutsideDay { background: #20252b; border: 1px solid #3c4652; border-radius: 4px; }
-QFrame#calendarOutsideDay { background: #1b1f24; color: #89939e; }
-QFrame { border: 1px solid #303943; }
-QStatusBar { background: #20252b; }
+FOCUS_STYLE = """
+QLineEdit:focus, QPushButton:focus, QToolButton:focus, QComboBox:focus, QSpinBox:focus {
+    border: 1px solid palette(highlight);
+}
+QSplitter::handle {
+    background: palette(mid);
+}
 """
+
+
+def _light_palette() -> QPalette:
+    window = QColor("#f3f4f6")
+    text = QColor("#1c1f24")
+    highlight = QColor("#3d6b8a")
+    muted = QColor("#5c6570")
+    palette = QPalette()
+    palette.setColor(QPalette.ColorRole.Window, window)
+    palette.setColor(QPalette.ColorRole.WindowText, text)
+    palette.setColor(QPalette.ColorRole.Base, QColor("#ffffff"))
+    palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#f7f8f9"))
+    palette.setColor(QPalette.ColorRole.Text, text)
+    palette.setColor(QPalette.ColorRole.Button, window)
+    palette.setColor(QPalette.ColorRole.ButtonText, text)
+    palette.setColor(QPalette.ColorRole.Highlight, highlight)
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
+    palette.setColor(QPalette.ColorRole.Mid, QColor("#d5d8dc"))
+    palette.setColor(QPalette.ColorRole.PlaceholderText, muted)
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText, muted)
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, muted)
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, muted)
+    return palette
 
 
 def main() -> int:
@@ -36,7 +52,9 @@ def main() -> int:
     app = QApplication([])
     app.setApplicationName("image-library")
     app.setApplicationVersion(__version__)
-    app.setStyleSheet(STYLE)
+    app.setStyle("Fusion")
+    app.setPalette(_light_palette())
+    app.setStyleSheet(FOCUS_STYLE)
 
     window = MainWindow()
     window.show()
