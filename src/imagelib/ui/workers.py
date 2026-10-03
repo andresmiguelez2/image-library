@@ -92,6 +92,14 @@ class ImageAsset:
     crops: tuple[QImage, ...]
 
 
+@dataclass(frozen=True)
+class FaceBounds:
+    x: float
+    y: float
+    w: float
+    h: float
+
+
 class ImageAssetTask(QRunnable):
     def __init__(self, path: str, faces: tuple, fallback_path: str | None = None, parent=None) -> None:
         super().__init__()

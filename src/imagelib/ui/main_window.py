@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -35,6 +36,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListView,
     QMainWindow,
+    QInputDialog,
     QPushButton,
     QRadioButton,
     QScrollArea,
@@ -51,7 +53,14 @@ from imagelib.config import config
 from imagelib.diagnostics import diagnostic, diagnostic_exception
 from imagelib.services import analyser, catalog
 from imagelib.ui.models import CalendarModel, ThumbnailDelegate, ThumbnailModel
-from imagelib.ui.workers import FunctionTask, ImageAsset, ImageAssetTask, RootValidationTask, ScanTask
+from imagelib.ui.workers import (
+    FaceBounds,
+    FunctionTask,
+    ImageAsset,
+    ImageAssetTask,
+    RootValidationTask,
+    ScanTask,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -463,7 +472,117 @@ class FaceImageWidget(QWidget):
             painter.drawRect(rectangle)
 
 
+class FaceMatchReviewDialog(QDialog):
+    merge_requested = Signal()
+    reject_requested = Signal()
+
+    def __init__(self, proposal: catalog.FaceMatchProposal, parent=None) -> None:
+        super().__init__(parent)
+        self.proposal = proposal
+        self._busy = False
+        self.setWindowTitle("Review face match")
+        self.setModal(False)
+        self.setMinimumWidth(520)
+
+        heading = QLabel(f"Could this group be {proposal.target_person_name}?")
+        heading.setObjectName("faceMatchHeading")
+        heading.setWordWrap(True)
+        samples = QHBoxLayout()
+        samples.setSpacing(16)
+        self.candidate_sample = self._sample_panel(
+            "Candidate group", f"{proposal.face_count} face(s)"
+        )
+        self.target_sample = self._sample_panel(
+            "Named person", proposal.target_person_name
+        )
+        samples.addWidget(self.candidate_sample[0])
+        samples.addWidget(self.target_sample[0])
+
+        similarity_text = (
+            f"Similarity: {proposal.similarity:.3f}"
+            if proposal.similarity is not None
+            else "Similarity unavailable"
+        )
+        self.similarity_label = QLabel(similarity_text)
+        self.message_label = QLabel()
+        self.message_label.setWordWrap(True)
+        self.message_label.setObjectName("faceMatchMessage")
+
+        self.merge_button = QPushButton("Merge")
+        self.merge_button.setAccessibleName(
+            f"Merge candidate group into {proposal.target_person_name}"
+        )
+        self.not_same_button = QPushButton("Not the same person")
+        self.not_same_button.setAccessibleName("Reject this person match")
+        self.later_button = QPushButton("Later")
+        self.merge_button.clicked.connect(lambda: self.merge_requested.emit())
+        self.not_same_button.clicked.connect(lambda: self.reject_requested.emit())
+        self.later_button.clicked.connect(lambda: self.reject())
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        actions.addWidget(self.later_button)
+        actions.addWidget(self.not_same_button)
+        actions.addWidget(self.merge_button)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(heading)
+        layout.addLayout(samples)
+        layout.addWidget(self.similarity_label)
+        layout.addWidget(self.message_label)
+        layout.addLayout(actions)
+
+    @staticmethod
+    def _sample_panel(title: str, description: str) -> tuple[QFrame, QLabel]:
+        panel = QFrame()
+        panel.setFrameShape(QFrame.Shape.StyledPanel)
+        panel.setMinimumWidth(230)
+        preview = QLabel("Loading sample…")
+        preview.setFixedSize(200, 200)
+        preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        preview.setAccessibleName(f"{title} face sample")
+        name = QLabel(description)
+        name.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        name.setWordWrap(True)
+        layout = QVBoxLayout(panel)
+        layout.addWidget(QLabel(title))
+        layout.addWidget(preview, 0, Qt.AlignmentFlag.AlignHCenter)
+        layout.addWidget(name)
+        return panel, preview
+
+    def set_sample(self, candidate: bool, pixmap: QPixmap) -> None:
+        preview = self.candidate_sample[1] if candidate else self.target_sample[1]
+        if pixmap.isNull():
+            preview.setText("Sample unavailable")
+        else:
+            preview.setText("")
+            preview.setPixmap(
+                pixmap.scaled(
+                    preview.size(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
+
+    def set_message(self, message: str) -> None:
+        self.message_label.setText(message)
+        self.message_label.setVisible(bool(message))
+
+    def set_busy(self, busy: bool) -> None:
+        self._busy = busy
+        self.merge_button.setEnabled(not busy)
+        self.not_same_button.setEnabled(not busy)
+        self.later_button.setEnabled(not busy)
+
+    def closeEvent(self, event) -> None:
+        if self._busy:
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+
 class DetailPanel(QFrame):
+    label_face_requested = Signal(int)
+
     def __init__(self, pool: QThreadPool, parent=None) -> None:
         super().__init__(parent)
         self.pool = pool
@@ -471,6 +590,10 @@ class DetailPanel(QFrame):
         self._faces = ()
         self.title = QLabel("Select an image to see details")
         self.title.setObjectName("detailTitle")
+        self.action_message = QLabel()
+        self.action_message.setWordWrap(True)
+        self.action_message.setObjectName("faceActionMessage")
+        self.action_message.setVisible(False)
         self.image = FaceImageWidget()
         self.face_scroll = QScrollArea()
         self.face_scroll.setWidgetResizable(True)
@@ -485,6 +608,7 @@ class DetailPanel(QFrame):
         self.face_scroll.setWidget(self.face_strip)
         layout = QVBoxLayout(self)
         layout.addWidget(self.title)
+        layout.addWidget(self.action_message)
         layout.addWidget(self.image, 1)
         layout.addWidget(self.face_scroll)
         self.setMinimumHeight(380)
@@ -492,6 +616,7 @@ class DetailPanel(QFrame):
     def clear(self, message: str = "Select an image to see details") -> None:
         self._serial += 1
         self.title.setText(message)
+        self.set_action_message("")
         self.image.set_asset(QPixmap())
         self._clear_faces()
 
@@ -508,6 +633,7 @@ class DetailPanel(QFrame):
         self._serial += 1
         serial = self._serial
         self._clear_faces()
+        self.set_action_message("")
         if detail is None:
             self.clear("The selected image is no longer in the catalogue")
             return
@@ -520,31 +646,38 @@ class DetailPanel(QFrame):
         task.signals.error.connect(lambda message, s=serial: self._asset_error(s, message))
         self.pool.start(task)
 
+    def set_action_message(self, message: str) -> None:
+        self.action_message.setText(message)
+        self.action_message.setVisible(bool(message))
+
     def _asset_ready(self, serial: int, asset: ImageAsset) -> None:
         if serial != self._serial:
             return
         pixmap = QPixmap.fromImage(asset.image) if not asset.image.isNull() else QPixmap()
         self.image.set_asset(pixmap, self._faces)
         for face, crop in zip(self._faces, asset.crops):
-            card = QWidget()
+            card = QToolButton()
+            card.setObjectName("faceCropCard")
             card.setMinimumWidth(120)
             card.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
-            card_layout = QVBoxLayout(card)
-            card_layout.setContentsMargins(6, 6, 6, 6)
-            preview = QLabel()
-            preview.setFixedSize(96, 96)
-            preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            card.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
+            card.setIconSize(QSize(96, 96))
+            card.setAutoRaise(True)
             crop_pixmap = QPixmap.fromImage(crop) if not crop.isNull() else QPixmap()
             if not crop_pixmap.isNull():
-                preview.setPixmap(crop_pixmap.scaled(preview.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+                card.setIcon(QIcon(crop_pixmap))
+            name = getattr(face, "person_name", None)
+            person_id = getattr(face, "person_id", None)
+            can_label = not name and person_id is not None and getattr(face, "id", None) is not None
+            display_name = name or "Unknown / Unassigned"
+            card.setText(f"{display_name}\nLabel person" if can_label else display_name)
+            if can_label:
+                card.setAccessibleName("Unlabelled face group. Activate to label this person")
+                card.setToolTip("Label this analyser-created face group")
+                card.clicked.connect(lambda _checked=False, face_id=face.id: self.label_face_requested.emit(face_id))
             else:
-                preview.setText("No crop")
-            name = face.person_name or "Unknown / Unassigned"
-            label = QLabel(name)
-            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            label.setWordWrap(True)
-            card_layout.addWidget(preview)
-            card_layout.addWidget(label)
+                card.setAccessibleName(f"Face sample: {display_name}")
+                card.setToolTip(display_name)
             self.face_layout.addWidget(card)
 
     def _asset_error(self, serial: int, message: str) -> None:
@@ -914,12 +1047,19 @@ class MainWindow(QMainWindow):
         self._validation_serial = 0
         self._detail_serial = 0
         self._browser_serial = 0
+        self._selected_image_id: int | None = None
+        self._face_label_active = False
+        self._proposal_query_serial = 0
+        self._proposal_dialog: FaceMatchReviewDialog | None = None
+        self._proposal_queue: list[catalog.FaceMatchProposal] = []
+        self._proposal_deferred: set[tuple[int, int]] = set()
         self._build_ui()
         self.analysis = AnalysisCoordinator(self.pool, self)
         self.analysis.status.connect(self._set_status)
         self.analysis.finished.connect(self._analysis_finished)
         self.analysis.failed.connect(self._analysis_failed)
-        self.analysis.catalogue_changed.connect(lambda: self._refresh(self._root_generation))
+        self.analysis.catalogue_changed.connect(self._analysis_catalogue_changed)
+        self._check_pending_proposals()
 
     def _build_ui(self) -> None:
         self.root_input = QLineEdit(str(self._root))
@@ -981,6 +1121,7 @@ class MainWindow(QMainWindow):
         self.calendar_stack.addWidget(self.browser)
         self.calendar_stack.addWidget(self.calendar)
         self.detail = DetailPanel(self.pool, self)
+        self.detail.label_face_requested.connect(self._request_face_label)
         central_splitter = QSplitter(Qt.Orientation.Vertical)
         central_splitter.addWidget(self.calendar_stack)
         central_splitter.addWidget(self.detail)
@@ -1028,6 +1169,17 @@ class MainWindow(QMainWindow):
         self.active_root_label.setText(f"Active root: {root}")
         self._root_generation += 1
         generation = self._root_generation
+        self._selected_image_id = None
+        self._detail_serial += 1
+        self._face_label_active = False
+        self._proposal_query_serial += 1
+        self._proposal_queue.clear()
+        self._proposal_deferred.clear()
+        previous_dialog = self._proposal_dialog
+        self._proposal_dialog = None
+        if previous_dialog is not None:
+            previous_dialog.set_busy(False)
+            previous_dialog.close()
         self._scan_cancel.set()
         self.analysis.cancel()
         self._scan_cancel = Event()
@@ -1036,6 +1188,7 @@ class MainWindow(QMainWindow):
         self.browser.set_root(root)
         self.calendar_model.set_groups({})
         self._set_status(f"Scanning {root}…")
+        self._check_pending_proposals()
         task = ScanTask(root, self._scan_cancel, self)
         task.signals.result.connect(lambda result, g=generation: self._scan_event(g, result))
         task.signals.error.connect(lambda message, g=generation: self._scan_error(g, message))
@@ -1061,6 +1214,7 @@ class MainWindow(QMainWindow):
                 self._set_status(
                     f"Scan complete: {value.indexed} indexed, {value.unchanged} unchanged, {value.errors} errors"
                 )
+                self._check_pending_proposals()
             self._refresh(generation)
 
     def _scan_error(self, generation: int, message: str) -> None:
@@ -1176,22 +1330,300 @@ class MainWindow(QMainWindow):
             self.calendar_stack.setCurrentIndex(0)
 
     def _image_clicked(self, item) -> None:
+        self._selected_image_id = item.id
+        self._load_detail(item.id)
+
+    def _load_detail(self, image_id: int) -> None:
         self._detail_serial += 1
         serial = self._detail_serial
+        generation = self._root_generation
         root = self._root
-        task = FunctionTask(lambda: catalog.get_image_detail(item.id, root=root), self)
-        task.signals.result.connect(lambda detail, s=serial: self._detail_ready(s, detail))
-        task.signals.error.connect(lambda message, s=serial: self._detail_error(s, message))
+        task = FunctionTask(lambda: catalog.get_image_detail(image_id, root=root), self)
+        task.signals.result.connect(
+            lambda detail, s=serial, g=generation: self._detail_ready(s, detail, g)
+        )
+        task.signals.error.connect(
+            lambda message, s=serial, g=generation: self._detail_error(s, message, g)
+        )
         self.pool.start(task)
 
-    def _detail_ready(self, serial: int, detail) -> None:
-        if serial == self._detail_serial:
+    def _detail_ready(self, serial: int, detail, generation: int | None = None) -> None:
+        if serial == self._detail_serial and (
+            generation is None or generation == self._root_generation
+        ):
             self.detail.show_detail(detail)
 
-    def _detail_error(self, serial: int, message: str) -> None:
-        if serial == self._detail_serial:
+    def _detail_error(self, serial: int, message: str, generation: int | None = None) -> None:
+        if serial == self._detail_serial and (
+            generation is None or generation == self._root_generation
+        ):
             logger.error("Detail catalogue callback failed for image request: %s", message)
             self.detail.clear(f"Could not load details: {message}")
+
+    def _reload_selected_detail(self) -> None:
+        if self._selected_image_id is not None:
+            self._load_detail(self._selected_image_id)
+
+    def _request_face_label(self, face_id: int) -> None:
+        if self._face_label_active:
+            return
+        generation = self._root_generation
+        root = self._root
+        name, accepted = QInputDialog.getText(
+            self,
+            "Label face group",
+            "Name this person:",
+            QLineEdit.EchoMode.Normal,
+        )
+        if not accepted:
+            return
+        name = name.strip()
+        if not name:
+            message = "Person name cannot be empty."
+            self.detail.set_action_message(message)
+            self._set_status(message)
+            return
+        self._face_label_active = True
+        self.detail.set_action_message(f"Labelling face group as {name}…")
+        task = FunctionTask(
+            lambda: analyser.label_face_group(face_id, name, root=root), self
+        )
+        task.signals.result.connect(
+            lambda result, g=generation, n=name: self._face_labelled(g, n, result)
+        )
+        task.signals.error.connect(
+            lambda message, g=generation: self._face_label_error(g, message)
+        )
+        self.pool.start(task)
+
+    def _face_labelled(self, generation: int, name: str, result) -> None:
+        if generation != self._root_generation:
+            return
+        self._face_label_active = False
+        self.detail.set_action_message(
+            f"Labelled {result.face_count} face(s) as {result.person_name}."
+        )
+        self._set_status(f"Labelled {result.face_count} face(s) as {result.person_name}")
+        self._refresh(generation)
+        self._reload_selected_detail()
+        self._check_pending_proposals()
+
+    def _face_label_error(self, generation: int, message: str) -> None:
+        if generation != self._root_generation:
+            return
+        self._face_label_active = False
+        visible = f"Could not label face group: {message}"
+        logger.error(visible)
+        self.detail.set_action_message(visible)
+        self._set_status(visible)
+
+    @staticmethod
+    def _proposal_key(proposal: catalog.FaceMatchProposal) -> tuple[int, int]:
+        return proposal.face_id, proposal.target_person_id
+
+    def _check_pending_proposals(self) -> None:
+        self._proposal_query_serial += 1
+        serial = self._proposal_query_serial
+        generation = self._root_generation
+        root = self._root
+        task = FunctionTask(
+            lambda: catalog.list_pending_face_match_proposals(root=root), self
+        )
+        task.signals.result.connect(
+            lambda proposals, s=serial, g=generation: self._pending_proposals_ready(
+                s, g, proposals
+            )
+        )
+        task.signals.error.connect(
+            lambda message, s=serial, g=generation: self._pending_proposals_error(
+                s, g, message
+            )
+        )
+        self.pool.start(task)
+
+    def _pending_proposals_ready(self, serial: int, generation: int, proposals) -> None:
+        if serial != self._proposal_query_serial or generation != self._root_generation:
+            return
+        queued = {self._proposal_key(item) for item in self._proposal_queue}
+        active_key = (
+            self._proposal_key(self._proposal_dialog.proposal)
+            if self._proposal_dialog is not None
+            else None
+        )
+        for proposal in proposals:
+            key = self._proposal_key(proposal)
+            if key in self._proposal_deferred or key == active_key or key in queued:
+                continue
+            self._proposal_queue.append(proposal)
+            queued.add(key)
+        self._show_next_proposal()
+
+    def _pending_proposals_error(self, serial: int, generation: int, message: str) -> None:
+        if serial != self._proposal_query_serial or generation != self._root_generation:
+            return
+        logger.error("Could not list pending face-match proposals: %s", message)
+        self._set_status(f"Could not load pending face-match proposals: {message}")
+
+    def _show_next_proposal(self) -> None:
+        if self._proposal_dialog is not None:
+            return
+        while self._proposal_queue:
+            proposal = self._proposal_queue.pop(0)
+            key = self._proposal_key(proposal)
+            if key in self._proposal_deferred:
+                continue
+            dialog = FaceMatchReviewDialog(proposal, self)
+            self._proposal_dialog = dialog
+            dialog.merge_requested.connect(
+                lambda d=dialog: self._resolve_face_proposal(d, accept=True)
+            )
+            dialog.reject_requested.connect(
+                lambda d=dialog: self._resolve_face_proposal(d, accept=False)
+            )
+            dialog.finished.connect(
+                lambda _result, d=dialog, k=key: self._proposal_dialog_finished(d, k)
+            )
+            generation = self._root_generation
+            self._load_proposal_sample(
+                dialog,
+                candidate=True,
+                path=proposal.sample_image_path,
+                thumbnail=proposal.sample_thumbnail_path,
+                bounds=FaceBounds(
+                    proposal.face_x, proposal.face_y, proposal.face_w, proposal.face_h
+                ),
+                generation=generation,
+            )
+            if proposal.target_sample_image_path:
+                self._load_proposal_sample(
+                    dialog,
+                    candidate=False,
+                    path=proposal.target_sample_image_path,
+                    thumbnail=proposal.target_sample_thumbnail_path,
+                    bounds=FaceBounds(
+                        proposal.target_face_x or 0,
+                        proposal.target_face_y or 0,
+                        proposal.target_face_w or 0,
+                        proposal.target_face_h or 0,
+                    ),
+                    generation=generation,
+                )
+            else:
+                dialog.set_sample(False, QPixmap())
+            dialog.show()
+            dialog.raise_()
+            dialog.activateWindow()
+            return
+
+    def _load_proposal_sample(
+        self,
+        dialog: FaceMatchReviewDialog,
+        *,
+        candidate: bool,
+        path: str,
+        thumbnail: str | None,
+        bounds: FaceBounds,
+        generation: int,
+    ) -> None:
+        task = ImageAssetTask(path, (bounds,), thumbnail, self)
+        task.signals.result.connect(
+            lambda asset, d=dialog, c=candidate, g=generation: self._proposal_sample_ready(
+                d, c, g, asset
+            )
+        )
+        task.signals.error.connect(
+            lambda _message, d=dialog, c=candidate, g=generation: self._proposal_sample_failed(
+                d, c, g
+            )
+        )
+        self.pool.start(task)
+
+    def _proposal_sample_ready(
+        self, dialog: FaceMatchReviewDialog, candidate: bool, generation: int, asset: ImageAsset
+    ) -> None:
+        if dialog is not self._proposal_dialog or generation != self._root_generation:
+            return
+        image = asset.crops[0] if asset.crops and not asset.crops[0].isNull() else asset.image
+        dialog.set_sample(candidate, QPixmap.fromImage(image) if not image.isNull() else QPixmap())
+
+    def _proposal_sample_failed(
+        self, dialog: FaceMatchReviewDialog, candidate: bool, generation: int
+    ) -> None:
+        if dialog is self._proposal_dialog and generation == self._root_generation:
+            dialog.set_sample(candidate, QPixmap())
+
+    def _proposal_dialog_finished(
+        self, dialog: FaceMatchReviewDialog, key: tuple[int, int]
+    ) -> None:
+        if dialog is not self._proposal_dialog:
+            return
+        self._proposal_dialog = None
+        self._proposal_deferred.add(key)
+        self._show_next_proposal()
+
+    def _resolve_face_proposal(self, dialog: FaceMatchReviewDialog, *, accept: bool) -> None:
+        if dialog is not self._proposal_dialog or dialog._busy:
+            return
+        proposal = dialog.proposal
+        generation = self._root_generation
+        root = self._root
+        dialog.set_busy(True)
+        if accept:
+            function = lambda: analyser.accept_face_match_proposal(
+                proposal.face_id, proposal.target_person_id, root=root
+            )
+        else:
+            function = lambda: analyser.reject_face_match_proposal(
+                proposal.face_id, proposal.target_person_id, root=root
+            )
+        task = FunctionTask(function, self)
+        task.signals.result.connect(
+            lambda result, d=dialog, g=generation, a=accept: self._proposal_resolved(
+                d, g, a, result
+            )
+        )
+        task.signals.error.connect(
+            lambda message, d=dialog, g=generation, a=accept: self._proposal_resolution_error(
+                d, g, a, message
+            )
+        )
+        self.pool.start(task)
+
+    def _proposal_resolved(
+        self, dialog: FaceMatchReviewDialog, generation: int, accepted: bool, result
+    ) -> None:
+        if generation != self._root_generation:
+            return
+        self._proposal_queue.clear()
+        self._proposal_query_serial += 1
+        self._refresh(generation)
+        self._reload_selected_detail()
+        if accepted:
+            self._set_status(
+                f"Merged {result.face_count} face(s) into {result.person_name}"
+            )
+        else:
+            self._set_status(
+                f"Rejected the match with {dialog.proposal.target_person_name} "
+                f"for {result.group_face_count} face(s)"
+            )
+        if dialog is self._proposal_dialog:
+            dialog.set_busy(False)
+            dialog.accept()
+        self._check_pending_proposals()
+
+    def _proposal_resolution_error(
+        self, dialog: FaceMatchReviewDialog, generation: int, accepted: bool, message: str
+    ) -> None:
+        if generation != self._root_generation:
+            return
+        action = "merge" if accepted else "reject"
+        visible = f"Could not {action} face match: {message}"
+        logger.error(visible)
+        self._set_status(visible)
+        if dialog is self._proposal_dialog:
+            dialog.set_message(visible)
+            dialog.set_busy(False)
 
     def _visualisation_changed(self, enabled: bool) -> None:
         self.detail.set_visualisation(enabled)
@@ -1217,6 +1649,11 @@ class MainWindow(QMainWindow):
     def _analysis_finished(self, _report) -> None:
         self.cancel_button.setEnabled(False)
         self._refresh(self._root_generation)
+        self._check_pending_proposals()
+
+    def _analysis_catalogue_changed(self) -> None:
+        self._refresh(self._root_generation)
+        self._check_pending_proposals()
 
     def _analysis_failed(self, message: str) -> None:
         logger.error("Analysis failed: %s", message)
@@ -1226,6 +1663,11 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._scan_cancel.set()
+        dialog = self._proposal_dialog
+        self._proposal_dialog = None
+        if dialog is not None:
+            dialog.set_busy(False)
+            dialog.close()
         self.analysis.shutdown()
         self.pool.clear()
         event.accept()
