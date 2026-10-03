@@ -3,7 +3,20 @@
 from datetime import datetime
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import BigInteger, CheckConstraint, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import (
+    BigInteger,
+    CheckConstraint,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+    text,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from imagelib.config import config
@@ -33,6 +46,7 @@ class Person(Base):
     """A cluster of face embeddings (an identified/grouped person)."""
 
     __tablename__ = "persons"
+    __table_args__ = (UniqueConstraint("name", name="uq_persons_name"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str | None] = mapped_column(String, nullable=True)
@@ -95,6 +109,41 @@ class Face(Base):
     image: Mapped[Image] = relationship(back_populates="faces")
     person: Mapped[Person | None] = relationship(
         back_populates="faces", foreign_keys=[person_id]
+    )
+
+
+class FaceMatchDecision(Base):
+    """A proposed or resolved match between a stable face and named person."""
+
+    __tablename__ = "face_match_decisions"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('proposed', 'accepted', 'rejected')",
+            name="ck_face_match_decisions_status",
+        ),
+        Index(
+            "uq_face_match_decisions_one_accepted_per_face",
+            "face_id",
+            unique=True,
+            postgresql_where=text("status = 'accepted'"),
+            sqlite_where=text("status = 'accepted'"),
+        ),
+    )
+
+    face_id: Mapped[int] = mapped_column(
+        ForeignKey("faces.id", ondelete="CASCADE"), primary_key=True
+    )
+    target_person_id: Mapped[int] = mapped_column(
+        ForeignKey("persons.id", ondelete="RESTRICT"), primary_key=True
+    )
+    status: Mapped[str] = mapped_column(
+        String, nullable=False, default="proposed", server_default="proposed"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )
 
 

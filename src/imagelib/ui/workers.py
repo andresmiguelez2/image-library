@@ -2,16 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
 
-from PySide6.QtCore import QObject, QRunnable, QRect, Signal
+from PySide6.QtCore import QObject, QRect, QRunnable, Signal
 from PySide6.QtGui import QImage
 
 from imagelib.diagnostics import diagnostic_exception
-
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +89,14 @@ class ScanTask(QRunnable):
 class ImageAsset:
     image: QImage
     crops: tuple[QImage, ...]
+
+
+@dataclass(frozen=True)
+class FaceBounds:
+    x: float
+    y: float
+    w: float
+    h: float
 
 
 class ImageAssetTask(QRunnable):
