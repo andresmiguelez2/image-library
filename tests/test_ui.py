@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import pytest
@@ -14,7 +14,8 @@ except (ImportError, OSError):
     pytest.skip("Qt libraries are unavailable", allow_module_level=True)
 
 from imagelib.services.catalog import ImageListItem
-from imagelib.ui.main_window import AnalysisCoordinator, DetailPanel, FaceImageWidget, MainWindow
+from imagelib.services import analyser
+from imagelib.ui.main_window import AnalysisCoordinator, CalendarView, DetailPanel, FaceImageWidget, MainWindow
 from imagelib.ui.models import CalendarModel, ThumbnailDelegate, ThumbnailModel, status_colour
 from imagelib.ui.workers import ImageAsset, ImageAssetTask
 
@@ -25,15 +26,21 @@ def application():
     return QApplication.instance() or QApplication([])
 
 
-def image_item(image_id: int, path: str, status: str = "indexed") -> ImageListItem:
+def image_item(
+    image_id: int,
+    path: str,
+    status: str = "indexed",
+    taken_at: datetime | None = None,
+    modified_at: datetime | None = None,
+) -> ImageListItem:
     return ImageListItem(
         id=image_id,
         path=path,
         relative_path=path,
         breadcrumbs=tuple(path.split("/")),
         thumb_path=None,
-        taken_at=None,
-        modified_at=None,
+        taken_at=taken_at,
+        modified_at=modified_at,
         width=10,
         height=10,
         face_count=0,
@@ -97,13 +104,147 @@ def test_detail_face_rectangles_preserve_letterbox_geometry(application):
     assert widget._visualise is False
 
 
-def test_calendar_model_has_date_sections_and_unknown_group(application):
+def test_calendar_model_keeps_date_groups_and_unknown_images(application):
     model = CalendarModel()
     model.set_groups({date(2026, 1, 2): [image_item(1, "one.jpg")], None: [image_item(2, "two.jpg")]})
-    assert model.rowCount() == 4
-    assert model.index(0, 0).data() == "2026-01-02"
-    assert model.index(2, 0).data() == "Unknown date"
-    assert model.item(model.index(3, 0)).id == 2
+    assert model.rowCount() == 2
+    assert model.groups[date(2026, 1, 2)][0].id == 1
+    assert model.groups[None][0].id == 2
+
+
+def test_calendar_month_layout_places_images_on_their_dates(application):
+    model = CalendarModel()
+    model.set_groups(
+        {
+            date(2026, 1, 2): [image_item(1, "one.jpg")],
+            date(2026, 1, 31): [image_item(2, "two.jpg")],
+            None: [image_item(3, "unknown.jpg")],
+        }
+    )
+    calendar = CalendarView(model)
+    calendar.set_month(date(2026, 1, 1))
+
+    assert len(calendar.day_cells) == 42
+    assert [item.id for item in calendar.day_cells[date(2026, 1, 2)].items] == [1]
+    assert [item.id for item in calendar.day_cells[date(2026, 1, 31)].items] == [2]
+    assert calendar.unknown_cell is not None
+    assert calendar.unknown_cell.items[0].id == 3
+    assert calendar.month_label.text() == "January 2026"
+    calendar.deleteLater()
+
+
+def test_calendar_thumbnail_updates_after_model_pixmap_is_set(application):
+    model = CalendarModel()
+    model.set_groups({date(2026, 1, 2): [image_item(1, "one.jpg")]})
+    calendar = CalendarView(model)
+    calendar.set_month(date(2026, 1, 1))
+    button = calendar.day_cells[date(2026, 1, 2)]._buttons[1]
+
+    assert button.icon().isNull()
+    model.set_pixmap(1, QPixmap(20, 20))
+
+    assert not button.icon().isNull()
+    calendar.deleteLater()
+
+
+def test_calendar_navigation_renders_the_requested_month(application):
+    model = CalendarModel()
+    model.set_groups(
+        {
+            date(2026, 1, 2): [image_item(1, "one.jpg")],
+            date(2026, 2, 2): [image_item(2, "two.jpg")],
+        }
+    )
+    calendar = CalendarView(model)
+    calendar.set_month(date(2026, 1, 1))
+    calendar.set_month(date(2026, 2, 1))
+
+    assert calendar.month_label.text() == "February 2026"
+    assert [item.id for item in calendar.day_cells[date(2026, 2, 2)].items] == [2]
+    calendar.deleteLater()
+
+
+def test_calendar_direct_month_and_year_navigation_renders_images(application):
+    model = CalendarModel()
+    model.set_groups(
+        {
+            date(2031, 5, 2): [image_item(1, "distant.jpg")],
+        }
+    )
+    calendar = CalendarView(model)
+
+    calendar.month_selector.setCurrentIndex(4)
+    assert calendar.current_month == date(date.today().year, 5, 1)
+    calendar.year_selector.setValue(2031)
+
+    assert calendar.current_month == date(2031, 5, 1)
+    assert calendar.month_label.text() == "May 2031"
+    assert [item.id for item in calendar.day_cells[date(2031, 5, 2)].items] == [1]
+    calendar.deleteLater()
+
+
+def test_calendar_navigation_controls_synchronise_without_signal_loops(application):
+    model = CalendarModel()
+    calendar = CalendarView(model)
+    changes = []
+    calendar.month_changed.connect(changes.append)
+
+    calendar.set_month(date(1, 1, 1))
+    assert calendar.month_selector.currentIndex() == 0
+    assert calendar.year_selector.value() == 1
+    assert not calendar.previous_button.isEnabled()
+    assert calendar.next_button.isEnabled()
+    assert changes == [date(1, 1, 1)]
+
+    calendar.set_month(date(9999, 12, 1))
+    assert calendar.month_selector.currentIndex() == 11
+    assert calendar.year_selector.value() == 9999
+    assert calendar.previous_button.isEnabled()
+    assert not calendar.next_button.isEnabled()
+    assert changes == [date(1, 1, 1), date(9999, 12, 1)]
+
+    calendar.set_month(date(2026, 6, 1))
+    changes.clear()
+    calendar.month_selector.setCurrentIndex(6)
+    assert calendar.current_month == date(2026, 7, 1)
+    assert changes == [date(2026, 7, 1)]
+    calendar.deleteLater()
+
+
+def test_calendar_image_click_and_select_all_expose_image_ids(application):
+    model = CalendarModel()
+    model.set_groups(
+        {date(2026, 1, 2): [image_item(1, "one.jpg"), image_item(2, "two.jpg")]}
+    )
+    calendar = CalendarView(model)
+    calendar.set_month(date(2026, 1, 1))
+    cell = calendar.day_cells[date(2026, 1, 2)]
+    clicked = []
+    calendar.image_clicked.connect(clicked.append)
+
+    cell._buttons[1].click()
+    assert clicked == [cell.items[0]]
+    assert calendar.selected_image_ids() == [1]
+
+    cell.select_button.click()
+    assert calendar.selected_image_ids() == [1, 2]
+    calendar.deleteLater()
+
+
+def test_main_window_analysis_uses_calendar_selection(application):
+    window = MainWindow()
+    window._root_generation = 1
+    window.calendar_model.set_groups({date(2026, 1, 2): [image_item(7, "seven.jpg")]})
+    window.calendar.set_month(date(2026, 1, 1))
+    window.calendar.day_cells[date(2026, 1, 2)].select_button.click()
+    calls = []
+    window.analysis.start = lambda root, image_ids=None: calls.append((root, image_ids))
+    window.calendar_stack.setCurrentWidget(window.calendar)
+
+    window._analyse_selected()
+
+    assert calls == [(window._root, [7])]
+    window.close()
 
 
 def test_image_asset_worker_loads_face_crops(application, tmp_path):
@@ -212,7 +353,29 @@ def test_cancelled_analysis_refreshes_after_late_persistence(application):
     assert changed == [True]
 
 
-def test_analysis_coordinator_fails_on_unmatched_single_image_response(application):
+def test_analysis_coordinator_logs_per_image_worker_errors(application, caplog):
+    class Result:
+        image_id = 42
+        status = "error"
+        error = "TypeError: unsupported DeepFace.represent argument"
+
+    class Report:
+        results = (Result(),)
+
+    coordinator = AnalysisCoordinator(QThreadPool())
+    coordinator._generation = 1
+    statuses = []
+    coordinator.status.connect(statuses.append)
+
+    with caplog.at_level("ERROR"):
+        coordinator._batch_saved(1, Report())
+
+    assert "image 42" in caplog.text
+    assert "unsupported DeepFace.represent argument" in caplog.text
+    assert statuses == ["Analysis complete with 1 error(s): TypeError: unsupported DeepFace.represent argument"]
+
+
+def test_analysis_coordinator_fails_on_unmatched_single_image_response(application, capsys):
     class Process:
         def __init__(self):
             self.read = True
@@ -234,6 +397,9 @@ def test_analysis_coordinator_fails_on_unmatched_single_image_response(applicati
 
     assert not coordinator._active
     assert errors == ["Invalid DeepFace worker response: unexpected DeepFace worker request_id: None"]
+    stderr = capsys.readouterr().err
+    assert 'DeepFace worker raw stdout response: {"ok": true, "faces": []}' in stderr
+    assert "response parsed request_id=None status='ok'" in stderr
 
 
 def test_analysis_coordinator_logs_worker_stderr_without_failing(application, caplog):
@@ -253,3 +419,94 @@ def test_analysis_coordinator_logs_worker_stderr_without_failing(application, ca
     assert coordinator._active
     assert errors == []
     assert "DeepFace worker stderr" in caplog.text
+
+
+def test_analysis_coordinator_prints_analysis_targets(application, capsys):
+    class Process:
+        def state(self):
+            return QProcess.ProcessState.NotRunning
+
+        def setProgram(self, _program):
+            pass
+
+        def setArguments(self, _arguments):
+            pass
+
+        def setProcessEnvironment(self, _environment):
+            pass
+
+        def start(self):
+            pass
+
+    coordinator = AnalysisCoordinator(QThreadPool())
+    coordinator.process = Process()
+    coordinator._active = True
+    coordinator._generation = 1
+    coordinator._targets_ready(
+        1,
+        [analyser.AnalysisTarget(7, "/photos/foto-ñ.jpg", "abc123", "indexed")],
+    )
+
+    stderr = capsys.readouterr().err
+    assert "Analysis targets selected count=1" in stderr
+    assert "image_id=7" in stderr
+    assert "foto-ñ.jpg" in stderr
+    assert "status='indexed'" in stderr
+    assert "content_hash='abc123'" in stderr
+    assert "DeepFace worker executable=" in stderr
+
+
+def test_analysis_coordinator_prints_start_root_and_selected_ids(application, capsys):
+    class Pool:
+        def start(self, task):
+            self.task = task
+
+    coordinator = AnalysisCoordinator(QThreadPool())
+    coordinator.pool = Pool()
+    coordinator.start(Path("/photos"), image_ids=[7, 8])
+
+    stderr = capsys.readouterr().err
+    assert "Analysis start root=/photos selected_image_ids=[7, 8]" in stderr
+
+
+def test_analysis_coordinator_prints_sent_request(application, capsys):
+    class Process:
+        def __init__(self):
+            self.requests = []
+
+        def state(self):
+            return QProcess.ProcessState.Running
+
+        def write(self, request):
+            self.requests.append(request)
+
+    process = Process()
+    coordinator = AnalysisCoordinator(QThreadPool())
+    coordinator.process = process
+    coordinator._active = True
+    coordinator._generation = 1
+    coordinator._targets = [analyser.AnalysisTarget(7, "/photos/foto-ñ.jpg", "abc123", "indexed")]
+
+    coordinator._send_next(1)
+
+    stderr = capsys.readouterr().err
+    assert "Analysis request sent:" in stderr
+    assert '"request_id": "1:0"' in stderr
+    assert process.requests[0].endswith(b"\n")
+
+
+def test_analysis_coordinator_prints_process_exit_diagnostics(application, capsys):
+    coordinator = AnalysisCoordinator(QThreadPool())
+    coordinator._active = True
+    coordinator._generation = 1
+    coordinator._process_generation = 1
+    coordinator._targets = [object()]
+    errors = []
+    coordinator.failed.connect(errors.append)
+
+    coordinator._process_finished(17, QProcess.ExitStatus.CrashExit)
+
+    stderr = capsys.readouterr().err
+    assert "exit_code=17" in stderr
+    assert "status=" in stderr
+    assert errors == ["DeepFace worker stopped before analysis completed"]

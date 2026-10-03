@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
+from datetime import date, timedelta
 from pathlib import Path
 from threading import Event
 
@@ -15,17 +16,20 @@ from PySide6.QtCore import (
     QProcess,
     QProcessEnvironment,
     QRect,
+    QSize,
     QThreadPool,
     QTimer,
     Qt,
     Signal,
 )
-from PySide6.QtGui import QColor, QImage, QPainter, QPixmap
+from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -35,15 +39,18 @@ from PySide6.QtWidgets import (
     QRadioButton,
     QScrollArea,
     QSizePolicy,
+    QSpinBox,
     QSplitter,
     QStackedWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
 from imagelib.config import config
+from imagelib.diagnostics import diagnostic, diagnostic_exception
 from imagelib.services import analyser, catalog
-from imagelib.ui.models import CalendarDelegate, CalendarModel, ThumbnailDelegate, ThumbnailModel
+from imagelib.ui.models import CalendarModel, ThumbnailDelegate, ThumbnailModel
 from imagelib.ui.workers import FunctionTask, ImageAsset, ImageAssetTask, RootValidationTask, ScanTask
 
 
@@ -79,6 +86,315 @@ class CollectionView(QListView):
 
     def selected_image_ids(self) -> list[int]:
         return [item.id for item in (self.model().item(index) for index in self.selectedIndexes()) if item]
+
+
+class CalendarDayCell(QFrame):
+    image_clicked = Signal(object)
+    selection_changed = Signal()
+
+    def __init__(
+        self,
+        day: date | None,
+        items,
+        pixmaps: dict[int, QPixmap],
+        selected_ids: set[int],
+        outside_month: bool = False,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.day = day
+        self.items = list(items)
+        self._buttons: dict[int, QToolButton] = {}
+        self.setObjectName("calendarOutsideDay" if outside_month else "calendarDay")
+        self.setProperty("outsideMonth", outside_month)
+        self.setMinimumHeight(96)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+
+        header = QHBoxLayout()
+        header.setContentsMargins(5, 4, 5, 2)
+        header.setSpacing(4)
+        heading = QLabel(str(day.day) if day else "Unknown date")
+        heading.setObjectName("calendarDayNumber")
+        header.addWidget(heading)
+        if self.items:
+            count = QLabel(str(len(self.items)))
+            count.setToolTip(f"{len(self.items)} image(s)")
+            header.addWidget(count)
+            self.select_button = QToolButton()
+            self.select_button.setText("All")
+            self.select_button.setToolTip("Select all images in this date")
+            self.select_button.setCheckable(True)
+            self.select_button.setAutoRaise(True)
+            self.select_button.clicked.connect(self._select_all)
+            header.addWidget(self.select_button)
+        else:
+            self.select_button = None
+        header.addStretch(1)
+
+        self.image_layout = QGridLayout()
+        self.image_layout.setContentsMargins(4, 2, 4, 4)
+        self.image_layout.setSpacing(3)
+        self.image_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        for index, item in enumerate(self.items):
+            button = QToolButton()
+            button.setCheckable(True)
+            button.setAutoRaise(True)
+            button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+            button.setIconSize(QSize(48, 48))
+            button.setFixedSize(54, 54)
+            button.setToolTip(f"{item.relative_path}\nClick to open image details")
+            button.setAccessibleName(Path(item.path).name)
+            button.toggled.connect(lambda _checked, b=button: self._button_toggled(b))
+            button.clicked.connect(lambda _checked=False, image=item: self.image_clicked.emit(image))
+            self._buttons[item.id] = button
+            self._set_button_pixmap(button, pixmaps.get(item.id))
+            button.setChecked(item.id in selected_ids)
+            self.image_layout.addWidget(button, index // 3, index % 3)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addLayout(header)
+        layout.addLayout(self.image_layout)
+        self._update_select_button()
+
+    @staticmethod
+    def _set_button_pixmap(button: QToolButton, pixmap: QPixmap | None) -> None:
+        if isinstance(pixmap, QPixmap) and not pixmap.isNull():
+            button.setIcon(QIcon(pixmap))
+            button.setText("")
+        else:
+            button.setIcon(QIcon())
+            button.setText("…")
+
+    def _button_toggled(self, button: QToolButton) -> None:
+        self._update_select_button()
+        self.selection_changed.emit()
+
+    def _update_select_button(self) -> None:
+        if self.select_button is not None:
+            selected = bool(self.items) and all(button.isChecked() for button in self._buttons.values())
+            self.select_button.blockSignals(True)
+            self.select_button.setChecked(selected)
+            self.select_button.blockSignals(False)
+
+    def _select_all(self, checked: bool) -> None:
+        for button in self._buttons.values():
+            button.setChecked(checked)
+        self._update_select_button()
+        self.selection_changed.emit()
+
+    def set_pixmap(self, image_id: int, pixmap: QPixmap) -> None:
+        button = self._buttons.get(image_id)
+        if button is not None:
+            self._set_button_pixmap(button, pixmap)
+
+    def selected_image_ids(self) -> list[int]:
+        return [image_id for image_id, button in self._buttons.items() if button.isChecked()]
+
+
+class CalendarView(QWidget):
+    image_clicked = Signal(object)
+    month_changed = Signal(object)
+    _minimum_month = date.min.replace(day=1)
+    _maximum_month = date.max.replace(day=1)
+
+    def __init__(self, model: CalendarModel, parent=None) -> None:
+        super().__init__(parent)
+        self.model = model
+        self._selected_ids: set[int] = set()
+        self.current_month = date.today().replace(day=1)
+        self.day_cells: dict[date, CalendarDayCell] = {}
+        self.unknown_cell: CalendarDayCell | None = None
+        self._syncing_navigation_controls = False
+
+        self.previous_button = QPushButton("‹")
+        self.previous_button.setToolTip("Previous month")
+        self.previous_button.clicked.connect(lambda: self.set_month(self._offset_month(-1)))
+        self.next_button = QPushButton("›")
+        self.next_button.setToolTip("Next month")
+        self.next_button.clicked.connect(lambda: self.set_month(self._offset_month(1)))
+        self.today_button = QPushButton("Today")
+        self.today_button.clicked.connect(lambda: self.set_month(date.today().replace(day=1)))
+        self.month_selector = QComboBox()
+        self.month_selector.addItems(
+            [date(2000, month, 1).strftime("%B") for month in range(1, 13)]
+        )
+        self.month_selector.setToolTip("Select month")
+        self.month_selector.setAccessibleName("Calendar month")
+        self.month_selector.currentIndexChanged.connect(self._month_selector_changed)
+        self.year_selector = QSpinBox()
+        self.year_selector.setRange(date.min.year, date.max.year)
+        self.year_selector.setKeyboardTracking(True)
+        self.year_selector.setToolTip("Enter year")
+        self.year_selector.setAccessibleName("Calendar year")
+        self.year_selector.valueChanged.connect(self._year_selector_changed)
+        self.month_label = QLabel()
+        self.month_label.setObjectName("calendarMonthLabel")
+        self.month_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        toolbar = QHBoxLayout()
+        toolbar.addWidget(self.previous_button)
+        toolbar.addWidget(self.month_label, 1)
+        toolbar.addWidget(self.month_selector)
+        toolbar.addWidget(self.year_selector)
+        toolbar.addWidget(self.today_button)
+        toolbar.addWidget(self.next_button)
+
+        weekdays = QGridLayout()
+        weekdays.setContentsMargins(3, 0, 3, 0)
+        weekdays.setSpacing(3)
+        for column, name in enumerate(("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")):
+            label = QLabel(name)
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            label.setObjectName("calendarWeekday")
+            weekdays.addWidget(label, 0, column)
+
+        self.grid_widget = QWidget()
+        self.grid_layout = QGridLayout(self.grid_widget)
+        self.grid_layout.setContentsMargins(3, 3, 3, 3)
+        self.grid_layout.setSpacing(3)
+        for column in range(7):
+            self.grid_layout.setColumnStretch(column, 1)
+        self.grid_scroll = QScrollArea()
+        self.grid_scroll.setWidgetResizable(True)
+        self.grid_scroll.setWidget(self.grid_widget)
+
+        self.unknown_title = QLabel("Unknown date")
+        self.unknown_title.setObjectName("calendarUnknownTitle")
+        self.unknown_layout = QVBoxLayout()
+        self.unknown_layout.setContentsMargins(0, 0, 0, 0)
+        self.unknown_layout.addWidget(self.unknown_title)
+        self.unknown_area = QWidget()
+        self.unknown_area.setLayout(self.unknown_layout)
+        self.unknown_area.setVisible(False)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(toolbar)
+        layout.addLayout(weekdays)
+        layout.addWidget(self.grid_scroll, 1)
+        layout.addWidget(self.unknown_area)
+
+        self.model.modelReset.connect(self._render)
+        self.model.pixmap_changed.connect(self.set_pixmap)
+        self._sync_navigation_controls()
+        self._render()
+
+    @staticmethod
+    def _first_of_month(value: date) -> date:
+        return value.replace(day=1)
+
+    def _offset_month(self, offset: int) -> date:
+        month_number = self.current_month.year * 12 + self.current_month.month - 1 + offset
+        minimum_number = self._minimum_month.year * 12 + self._minimum_month.month - 1
+        maximum_number = self._maximum_month.year * 12 + self._maximum_month.month - 1
+        month_number = max(minimum_number, min(maximum_number, month_number))
+        return date(month_number // 12, month_number % 12 + 1, 1)
+
+    def _month_selector_changed(self, month_index: int) -> None:
+        if not self._syncing_navigation_controls:
+            self.set_month(date(self.year_selector.value(), month_index + 1, 1))
+
+    def _year_selector_changed(self, year: int) -> None:
+        if not self._syncing_navigation_controls:
+            self.set_month(date(year, self.month_selector.currentIndex() + 1, 1))
+
+    def _sync_navigation_controls(self) -> None:
+        self._syncing_navigation_controls = True
+        try:
+            self.month_selector.blockSignals(True)
+            self.year_selector.blockSignals(True)
+            self.month_selector.setCurrentIndex(self.current_month.month - 1)
+            self.year_selector.setValue(self.current_month.year)
+        finally:
+            self.month_selector.blockSignals(False)
+            self.year_selector.blockSignals(False)
+            self._syncing_navigation_controls = False
+        self.previous_button.setEnabled(self.current_month > self._minimum_month)
+        self.next_button.setEnabled(self.current_month < self._maximum_month)
+
+    def set_month(self, month: date) -> None:
+        month = self._first_of_month(month)
+        if month == self.current_month:
+            self._sync_navigation_controls()
+            self._render()
+            return
+        self.current_month = month
+        self._sync_navigation_controls()
+        self._render()
+        self.month_changed.emit(month)
+
+    def _clear_layout(self, layout) -> None:
+        while layout.count():
+            child = layout.takeAt(0)
+            if child.widget() is not None:
+                child.widget().deleteLater()
+
+    def _render(self) -> None:
+        all_ids = {item.id for item in self.model.items}
+        self._selected_ids.intersection_update(all_ids)
+        self.month_label.setText(self.current_month.strftime("%B %Y"))
+        self._clear_layout(self.grid_layout)
+        self.day_cells = {}
+        first = self.current_month
+        for position in range(42):
+            try:
+                day = first + timedelta(days=position - first.weekday())
+            except OverflowError:
+                cell = QWidget(self.grid_widget)
+                cell.setMinimumHeight(96)
+                cell.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+                self.grid_layout.addWidget(cell, position // 7, position % 7)
+                continue
+            in_month = day.month == first.month
+            cell = CalendarDayCell(
+                day,
+                self.model.groups.get(day, []) if in_month else [],
+                self.model.pixmaps,
+                self._selected_ids,
+                outside_month=not in_month,
+                parent=self.grid_widget,
+            )
+            cell.image_clicked.connect(self.image_clicked)
+            cell.selection_changed.connect(lambda c=cell: self._cell_selection_changed(c))
+            self.grid_layout.addWidget(cell, position // 7, position % 7)
+            self.day_cells[day] = cell
+
+        while self.unknown_layout.count() > 1:
+            child = self.unknown_layout.takeAt(1)
+            if child.widget() is not None:
+                child.widget().deleteLater()
+        unknown_items = self.model.groups.get(None, [])
+        self.unknown_cell = None
+        if unknown_items:
+            self.unknown_cell = CalendarDayCell(
+                None,
+                unknown_items,
+                self.model.pixmaps,
+                self._selected_ids,
+                parent=self.unknown_area,
+            )
+            self.unknown_cell.image_clicked.connect(self.image_clicked)
+            self.unknown_cell.selection_changed.connect(
+                lambda c=self.unknown_cell: self._cell_selection_changed(c)
+            )
+            self.unknown_layout.addWidget(self.unknown_cell)
+            self.unknown_area.setVisible(True)
+        else:
+            self.unknown_area.setVisible(False)
+
+    def _cell_selection_changed(self, cell: CalendarDayCell) -> None:
+        cell_ids = {item.id for item in cell.items}
+        self._selected_ids.difference_update(cell_ids)
+        self._selected_ids.update(cell.selected_image_ids())
+
+    def set_pixmap(self, image_id: int, pixmap: QPixmap) -> None:
+        for cell in self.day_cells.values():
+            cell.set_pixmap(image_id, pixmap)
+        if self.unknown_cell is not None:
+            self.unknown_cell.set_pixmap(image_id, pixmap)
+
+    def selected_image_ids(self) -> list[int]:
+        return [item.id for item in self.model.items if item.id in self._selected_ids]
 
 
 class FaceImageWidget(QWidget):
@@ -352,6 +668,7 @@ class AnalysisCoordinator(QObject):
         self._pending = {}
         self._responses = []
         self._queue_index = 0
+        diagnostic(f"Analysis start root={root} selected_image_ids={image_ids!r}")
         self.status.emit("Selecting images for analysis…")
         task = FunctionTask(
             lambda: analyser.select_analysis_targets(root=root, image_ids=image_ids),
@@ -376,6 +693,12 @@ class AnalysisCoordinator(QObject):
         if not self._active or generation != self._generation:
             return
         self._targets = list(targets)
+        diagnostic(f"Analysis targets selected count={len(self._targets)}")
+        for target in self._targets:
+            diagnostic(
+                f"Analysis target image_id={target.id} path={target.path!r} "
+                f"status={target.status!r} content_hash={target.content_hash!r}"
+            )
         if not self._targets:
             self._active = False
             self.status.emit("No eligible images to analyse")
@@ -398,15 +721,25 @@ class AnalysisCoordinator(QObject):
             self._starting_after_finish = False
             self.process.setProgram(sys.executable)
             self.process.setArguments(["-m", "imagelib.services.deepface_worker"])
+            diagnostic(
+                f"DeepFace worker executable={sys.executable!r} "
+                "arguments=['-m', 'imagelib.services.deepface_worker']"
+            )
             environment = QProcessEnvironment.systemEnvironment()
             self.process.setProcessEnvironment(environment)
-            self.process.start()
+            try:
+                self.process.start()
+            except Exception as exc:
+                diagnostic_exception("DeepFace worker process start failed", exc)
+                self._active = False
+                self.failed.emit(f"DeepFace worker start failed: {exc}")
         else:
             self._starting_after_finish = True
             self._process_generation = generation
             self.process.kill()
 
     def _process_started(self) -> None:
+        diagnostic(f"DeepFace worker process started pid={self.process.processId()}")
         if self._active and not self._starting_after_finish and self._process_generation == self._generation:
             self._send_next(self._generation)
 
@@ -423,28 +756,47 @@ class AnalysisCoordinator(QObject):
         self._pending[request_id] = (target, {})
         self._queue_index += 1
         request = {"op": "analyse", "path": target.path, "request_id": request_id}
-        self.process.write((json.dumps(request) + "\n").encode())
+        diagnostic(f"Analysis request sent: {json.dumps(request, ensure_ascii=False)}")
+        try:
+            self.process.write((json.dumps(request, ensure_ascii=False) + "\n").encode())
+        except Exception as exc:
+            diagnostic_exception(f"Analysis request failed request_id={request_id!r}", exc)
+            self._pending.pop(request_id, None)
+            self._active = False
+            self.failed.emit(f"Could not send analysis request: {exc}")
 
     def _read_output(self) -> None:
         while self.process.canReadLine():
             raw = bytes(self.process.readLine()).strip()
             if not raw:
                 continue
+            diagnostic(f"DeepFace worker raw stdout response: {raw.decode(errors='replace')}")
             try:
                 response = json.loads(raw.decode())
                 request_id = response.get("request_id")
+                response_status = response.get("status", "ok" if response.get("ok") else "error")
+                diagnostic(
+                    f"DeepFace worker response parsed request_id={request_id!r} "
+                    f"status={response_status!r}"
+                )
                 pending = self._pending.pop(request_id, None)
                 if pending is None or not self._active:
                     if pending is None and self._active:
                         raise ValueError(f"unexpected DeepFace worker request_id: {request_id!r}")
                     continue
                 target, _ = pending
+                if response.get("ok") is False:
+                    diagnostic(
+                        f"Analysis response error image_id={target.id} path={target.path!r} "
+                        f"error={response.get('error', 'DeepFace worker failed')!r}"
+                    )
                 self._responses.append((target, response))
                 self.progress.emit(len(self._responses), len(self._targets))
                 self.status.emit(f"Analysing {len(self._responses)} of {len(self._targets)}…")
                 self._send_next(self._generation)
             except (UnicodeDecodeError, json.JSONDecodeError, AttributeError, ValueError) as exc:
                 logger.exception("Invalid DeepFace worker response")
+                diagnostic_exception("Invalid DeepFace worker response", exc)
                 if self._active:
                     self._active = False
                     self.failed.emit(f"Invalid DeepFace worker response: {exc}")
@@ -453,12 +805,17 @@ class AnalysisCoordinator(QObject):
         stderr = bytes(self.process.readAllStandardError()).decode(errors="replace").strip()
         if stderr:
             logger.warning("DeepFace worker stderr: %s", stderr)
+            diagnostic(f"DeepFace worker stderr: {stderr}")
 
     def _persist_batch(self, generation: int) -> None:
         if not self._active or generation != self._generation or not self._responses:
             return
         self.status.emit("Saving analysis results and rebuilding people…")
         responses = list(self._responses)
+        diagnostic(
+            f"Analysis persistence start responses={len(responses)} "
+            f"image_ids={[target.id for target, _response in responses]!r}"
+        )
         task = FunctionTask(lambda: analyser.persist_worker_batch(responses), self)
         task.signals.result.connect(lambda report, g=generation: self._batch_saved(g, report))
         task.signals.error.connect(lambda message, g=generation: self._persist_error(g, message))
@@ -466,14 +823,35 @@ class AnalysisCoordinator(QObject):
         self.pool.start(task)
 
     def _batch_saved(self, generation: int, report) -> None:
+        diagnostic(f"Analysis persistence completed report={report!r}")
+        errors = [result for result in getattr(report, "results", ()) if result.status == "error"]
+        for result in getattr(report, "results", ()):
+            diagnostic(
+                f"Analysis result image_id={result.image_id} status={result.status!r} "
+                f"accepted={getattr(result, 'accepted', None)} "
+                f"faces={getattr(result, 'face_count', None)} error={result.error!r}"
+            )
+        for result in errors:
+            logger.error(
+                "Analysis failed for image %s: %s",
+                result.image_id,
+                result.error or "DeepFace worker failed",
+            )
         if generation != self._generation:
             self.catalogue_changed.emit()
             return
         self.finished.emit(report)
-        self.status.emit("Analysis complete")
+        if errors:
+            self.status.emit(
+                f"Analysis complete with {len(errors)} error(s): "
+                f"{errors[0].error or 'DeepFace worker failed'}"
+            )
+        else:
+            self.status.emit("Analysis complete")
 
     def _persist_error(self, generation: int, message: str) -> None:
         logger.error("Analysis persistence callback failed for %s: %s", self._root, message)
+        diagnostic(f"Analysis persistence failed root={self._root!r}: {message}")
         if generation == self._generation:
             self.failed.emit(f"Could not save analysis results: {message}")
         else:
@@ -481,6 +859,7 @@ class AnalysisCoordinator(QObject):
 
     def _process_error(self, error) -> None:
         logger.error("DeepFace worker process error: %s", error)
+        diagnostic(f"DeepFace worker process error error={error!r}")
         if self._starting_after_finish:
             return
         if (
@@ -492,6 +871,7 @@ class AnalysisCoordinator(QObject):
             self.failed.emit(f"DeepFace worker error: {error}")
 
     def _process_finished(self, _exit_code, _exit_status) -> None:
+        diagnostic(f"DeepFace worker process finished exit_code={_exit_code} status={_exit_status!r}")
         if (
             self._starting_after_finish
             and self._active
@@ -514,6 +894,7 @@ class AnalysisCoordinator(QObject):
         self._active = False
         self._generation += 1
         if self.process.state() == QProcess.ProcessState.Running:
+            diagnostic("DeepFace worker request sent: shutdown")
             self.process.write(b'{"op":"shutdown","request_id":"shutdown"}\n')
             QTimer.singleShot(1200, self.process.kill)
         elif self.process.state() != QProcess.ProcessState.NotRunning:
@@ -594,9 +975,7 @@ class MainWindow(QMainWindow):
         self.browser.directory_changed.connect(self._browse_directory)
         self.browser.image_clicked.connect(self._image_clicked)
         self.calendar_model = CalendarModel(self)
-        self.calendar = CollectionView(self.calendar_model, self)
-        self.calendar.setUniformItemSizes(False)
-        self.calendar.setItemDelegate(CalendarDelegate(self.calendar))
+        self.calendar = CalendarView(self.calendar_model, self)
         self.calendar.image_clicked.connect(self._image_clicked)
         self.calendar_stack = QStackedWidget()
         self.calendar_stack.addWidget(self.browser)
@@ -727,7 +1106,7 @@ class MainWindow(QMainWindow):
         self.calendar_model.set_groups(groups)
         if browser_serial == self._browser_serial and directory == self.browser.directory:
             self._load_thumbnails(self.browser.model, browser_items, generation)
-        self._load_thumbnails(self.calendar_model, [entry.item for entry in self.calendar_model.entries if entry.item], generation)
+        self._load_thumbnails(self.calendar_model, self.calendar_model.items, generation)
 
     def _catalog_error(self, generation: int, message: str) -> None:
         if generation != self._root_generation:
@@ -820,6 +1199,7 @@ class MainWindow(QMainWindow):
     def _analyse_selected(self) -> None:
         view = self.calendar if self.calendar_stack.currentIndex() == 1 else self.browser.view
         image_ids = view.selected_image_ids()
+        logger.info(f'Analysing images {image_ids}')
         if not image_ids:
             self._set_status("Select one or more images first")
             return

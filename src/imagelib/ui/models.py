@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
-from PySide6.QtCore import QAbstractListModel, QModelIndex, QRect, QSize, Qt
+from PySide6.QtCore import QAbstractListModel, QModelIndex, QRect, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPixmap
 from PySide6.QtWidgets import QStyle, QStyleOptionViewItem, QStyledItemDelegate
 
@@ -105,80 +104,23 @@ class ThumbnailDelegate(QStyledItemDelegate):
         return THUMBNAIL_SIZE
 
 
-@dataclass(frozen=True)
-class CalendarEntry:
-    heading: bool
-    label: str
-    item: ImageListItem | None = None
-
-
 class CalendarModel(ThumbnailModel):
+    pixmap_changed = Signal(int, object)
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self.entries: list[CalendarEntry] = []
-
-    def rowCount(self, parent=QModelIndex()) -> int:
-        return 0 if parent.isValid() else len(self.entries)
-
-    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
-        if not index.isValid() or not 0 <= index.row() < len(self.entries):
-            return None
-        entry = self.entries[index.row()]
-        if entry.heading:
-            if role == Qt.ItemDataRole.DisplayRole:
-                return entry.label
-            if role == Qt.ItemDataRole.SizeHintRole:
-                return QSize(180, 40)
-            return None
-        item = entry.item
-        if role == Qt.ItemDataRole.DisplayRole:
-            return Path(item.path).name
-        if role == Qt.ItemDataRole.UserRole:
-            return item
-        if role == Qt.ItemDataRole.DecorationRole:
-            return self.pixmaps.get(item.id)
-        if role == Qt.ItemDataRole.ToolTipRole:
-            return f"{item.relative_path}\n{item.status}"
-        if role == Qt.ItemDataRole.SizeHintRole:
-            return THUMBNAIL_SIZE
-        return None
-
-    def flags(self, index):
-        flags = super().flags(index)
-        if index.isValid() and self.entries[index.row()].heading:
-            return Qt.ItemFlag.ItemIsEnabled
-        return flags
+        self.groups: dict[date | None, list[ImageListItem]] = {}
 
     def set_groups(self, groups: dict[date | None, list[ImageListItem]]) -> None:
-        entries: list[CalendarEntry] = []
         items: list[ImageListItem] = []
-        for group, group_items in groups.items():
-            entries.append(CalendarEntry(True, group.isoformat() if group else "Unknown date"))
-            entries.extend(CalendarEntry(False, "", item) for item in group_items)
-            items.extend(group_items)
         self.beginResetModel()
-        self.entries = entries
+        self.groups = {group: list(group_items) for group, group_items in groups.items()}
+        for group_items in self.groups.values():
+            items.extend(group_items)
         self.items = items
         self.pixmaps = {}
         self.endResetModel()
 
-    def item(self, index: QModelIndex) -> ImageListItem | None:
-        if not index.isValid() or self.entries[index.row()].heading:
-            return None
-        return self.entries[index.row()].item
-
-
-class CalendarDelegate(ThumbnailDelegate):
-    def paint(self, painter, option, index) -> None:
-        model = index.model()
-        if model.entries[index.row()].heading:
-            painter.save()
-            painter.fillRect(option.rect, QColor("#303944"))
-            painter.setPen(QColor("#ffffff"))
-            painter.drawText(option.rect.adjusted(12, 0, -12, 0), Qt.AlignmentFlag.AlignVCenter, index.data())
-            painter.restore()
-            return
-        super().paint(painter, option, index)
-
-    def sizeHint(self, option, index) -> QSize:
-        return QSize(180, 40) if index.model().entries[index.row()].heading else super().sizeHint(option, index)
+    def set_pixmap(self, image_id: int, pixmap: QPixmap) -> None:
+        super().set_pixmap(image_id, pixmap)
+        self.pixmap_changed.emit(image_id, pixmap)

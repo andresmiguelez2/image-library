@@ -1,5 +1,5 @@
 from datetime import datetime
-from io import StringIO
+from io import BytesIO, StringIO
 import json
 from pathlib import Path
 import sys
@@ -11,6 +11,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from imagelib.db.models import Base, Face, Image, Person, Source
+from imagelib.diagnostics import diagnostic
 from imagelib.services import analyser, catalog, scanner
 from imagelib.services.deepface_worker import run_worker
 
@@ -350,7 +351,7 @@ def test_process_worker_response_persists_atomically_and_rejects_stale_hash(tmp_
     assert not stale.accepted and stale.status == "stale"
 
 
-def test_process_batch_rebuild_api_uses_fake_faces_without_deepface(tmp_path):
+def test_process_batch_rebuild_api_uses_fake_faces_without_deepface(tmp_path, capsys):
     factory = database()
     embedding = [1.0] + [0.0] * 511
     with factory() as session:
@@ -390,10 +391,18 @@ def test_process_batch_rebuild_api_uses_fake_faces_without_deepface(tmp_path):
     assert [result.status for result in batch.results] == ["analysed", "analysed"]
     assert batch.clusters.faces == 2
     assert batch.clusters.clustered_faces == 2
+    stderr = capsys.readouterr().err
+    assert "Analysis persistence service started" in stderr
+    assert "Analysis persistence image completed image_id=" in stderr
+    assert "Analysis persistence service completed" in stderr
 
 
 def test_deepface_worker_loads_model_once():
-    input_stream = StringIO('{"op":"analyse","path":"one.jpg"}\n{"op":"analyse","path":"two.jpg"}\n{"op":"shutdown"}\n')
+    input_stream = StringIO(
+        '{"op":"analyse","path":"one.jpg","request_id":"one"}\n'
+        '{"op":"analyse","path":"two.jpg","request_id":"two"}\n'
+        '{"op":"shutdown","request_id":"stop"}\n'
+    )
     output_stream = StringIO()
     models = []
 
@@ -410,9 +419,10 @@ def test_deepface_worker_loads_model_once():
     )
 
     lines = [line for line in output_stream.getvalue().splitlines()]
+    responses = [json.loads(line) for line in lines]
     assert len(models) == 1
-    assert '"ok": true' in lines[0]
-    assert '"ok": true' in lines[1]
+    assert [response["request_id"] for response in responses] == ["one", "two", "stop"]
+    assert all(response["ok"] for response in responses)
 
 
 def test_deepface_worker_redirects_model_output_and_returns_errors(capsys):
@@ -436,9 +446,66 @@ def test_deepface_worker_redirects_model_output_and_returns_errors(capsys):
     stderr = capsys.readouterr().err
     assert "TensorFlow startup noise" in stderr
     assert "DeepFace representer noise" in stderr
+    assert "DeepFace worker request operation='analyse'" in stderr
+    assert "path='one.jpg'" in stderr
+    assert "RuntimeError: analysis failed" in stderr
+    assert "Traceback (most recent call last)" in stderr
 
 
-def test_deepface_worker_uses_configured_detector(monkeypatch):
+def test_diagnostic_flushes_to_supplied_stream():
+    class Stream:
+        def __init__(self):
+            self.values = []
+            self.flush_count = 0
+
+        def write(self, value):
+            self.values.append(value)
+
+        def flush(self):
+            self.flush_count += 1
+
+    stream = Stream()
+    diagnostic("flushed", stream=stream)
+
+    assert "flushed" in "".join(stream.values)
+    assert stream.flush_count == 1
+
+
+def test_deepface_worker_default_representer_matches_installed_api(tmp_path, monkeypatch):
+    calls = []
+
+    class DeepFace:
+        @staticmethod
+        def represent(*, img_path, model_name, detector_backend, enforce_detection):
+            calls.append(
+                {
+                    "img_path": img_path,
+                    "model_name": model_name,
+                    "detector_backend": detector_backend,
+                    "enforce_detection": enforce_detection,
+                }
+            )
+            return {"embedding": [0.1] * 512}
+
+    from imagelib.services import deepface_worker
+
+    image_path = tmp_path / "foto-ñ.jpg"
+    image_path.write_bytes(b"fixture")
+    fake_deepface = ModuleType("deepface")
+    fake_deepface.DeepFace = DeepFace
+    monkeypatch.setitem(sys.modules, "deepface", fake_deepface)
+
+    result = deepface_worker._default_representer(str(image_path), object())
+
+    assert result == [{"embedding": [0.1] * 512}]
+    assert isinstance(calls[0]["img_path"], BytesIO)
+    assert calls[0]["img_path"].read() == b"fixture"
+    assert calls[0]["model_name"] == "Facenet512"
+    assert calls[0]["detector_backend"] == deepface_worker.config["analysis"].get("detector_backend", "retinaface")
+    assert calls[0]["enforce_detection"] is False
+
+
+def test_deepface_worker_uses_configured_detector(tmp_path, monkeypatch):
     calls = []
 
     class DeepFace:
@@ -453,6 +520,8 @@ def test_deepface_worker_uses_configured_detector(monkeypatch):
     fake_deepface = ModuleType("deepface")
     fake_deepface.DeepFace = DeepFace
     monkeypatch.setitem(sys.modules, "deepface", fake_deepface)
-    deepface_worker._default_representer("photo.jpg", object())
+    image_path = tmp_path / "photo.jpg"
+    image_path.write_bytes(b"fixture")
+    deepface_worker._default_representer(str(image_path), object())
 
     assert calls[0]["detector_backend"] == "opencv"

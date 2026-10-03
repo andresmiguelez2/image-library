@@ -10,6 +10,8 @@ from threading import Event
 from PySide6.QtCore import QObject, QRunnable, QRect, Signal
 from PySide6.QtGui import QImage
 
+from imagelib.diagnostics import diagnostic_exception
+
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +34,10 @@ class FunctionTask(QRunnable):
             self.signals.result.emit(self.function())
         except Exception as exc:
             logger.exception("UI background task failed (%s)", getattr(self.function, "__name__", "callable"))
+            diagnostic_exception(
+                f"UI background task failed ({getattr(self.function, '__name__', 'callable')})",
+                exc,
+            )
             self.signals.error.emit(f"{type(exc).__name__}: {exc}")
         finally:
             self.signals.finished.emit()

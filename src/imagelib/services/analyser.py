@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from threading import Lock
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -13,6 +14,7 @@ from sqlalchemy import delete, select, update
 from imagelib.config import config
 from imagelib.db.models import Face, Image, Person
 from imagelib.db.session import SessionLocal
+from imagelib.diagnostics import diagnostic
 from imagelib.services.scanner import sha256_file
 
 _model = None
@@ -174,7 +176,7 @@ def _represent(path: Path, model) -> list[dict]:
     from deepface import DeepFace
 
     result = DeepFace.represent(
-        img_path=str(path),
+        img_path=BytesIO(path.read_bytes()),
         model_name="Facenet512",
         detector_backend=config["analysis"].get("detector_backend", "retinaface"),
         enforce_detection=False,
@@ -452,10 +454,26 @@ def persist_worker_batch(
     failed response is reported in-place and does not prevent other responses
     from being persisted or clustered.
     """
+    diagnostic("Analysis persistence service started")
     target_list = []
     result_list = []
     for target, response in responses:
         target_list.append(target)
+        response_status = (
+            response.get("status", "ok" if response.get("ok") else "error")
+            if isinstance(response, Mapping)
+            else "faces"
+        )
+        diagnostic(
+            f"Analysis persistence image start image_id={target.id} path={target.path!r} "
+            f"status={target.status!r} content_hash={target.content_hash!r} "
+            f"response_status={response_status!r}"
+        )
+        if isinstance(response, Mapping) and response.get("ok") is False:
+            diagnostic(
+                f"Analysis persistence response error image_id={target.id} "
+                f"error={response.get('error', 'Worker analysis failed')!r}"
+            )
         result = persist_worker_response(
             target.id,
             response,
@@ -463,6 +481,11 @@ def persist_worker_batch(
             session_factory=session_factory,
         )
         result_list.append(result)
+        diagnostic(
+            f"Analysis persistence image completed image_id={result.image_id} "
+            f"status={result.status!r} accepted={result.accepted} "
+            f"faces={result.face_count} error={result.error!r}"
+        )
         if progress:
             progress(result)
     if any(result.accepted for result in result_list):
@@ -470,7 +493,12 @@ def persist_worker_batch(
     else:
         with session_factory() as session:
             clusters = _cluster_summary(session)
-    return WorkerBatchReport(tuple(target_list), tuple(result_list), clusters)
+    report = WorkerBatchReport(tuple(target_list), tuple(result_list), clusters)
+    diagnostic(
+        f"Analysis persistence service completed targets={len(report.targets)} "
+        f"results={len(report.results)} clusters={report.clusters!r}"
+    )
+    return report
 
 
 def analyse_images(
