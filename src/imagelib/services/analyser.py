@@ -10,9 +10,10 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from sklearn.cluster import DBSCAN
 from sqlalchemy import delete, select, update
+from sqlalchemy.exc import IntegrityError
 
-from imagelib.config import config
-from imagelib.db.models import Face, Image, Person
+from imagelib.config import active_root, config
+from imagelib.db.models import Face, FaceMatchDecision, Image, Person
 from imagelib.db.session import SessionLocal
 from imagelib.diagnostics import diagnostic
 from imagelib.services.scanner import sha256_file
@@ -69,6 +70,25 @@ class WorkerBatchReport:
     targets: tuple[AnalysisTarget, ...]
     results: tuple[WorkerAnalysisResult, ...]
     clusters: ClusterReport
+
+
+@dataclass(frozen=True)
+class GroupLabelResult:
+    """Named identity and face count after resolving one current face group."""
+
+    person_id: int
+    person_name: str
+    face_count: int
+
+
+@dataclass(frozen=True)
+class FaceMatchResolutionResult:
+    """Result of accepting or rejecting one group-to-person proposal."""
+
+    face_id: int
+    target_person_id: int
+    status: str
+    group_face_count: int
 
 
 def _path_is_under(path: Path, root: Path) -> bool:
@@ -206,6 +226,17 @@ def _worker_error_text(error: object) -> str:
     return str(error)[:4000]
 
 
+def _delete_image_faces(session, image_id: int) -> None:
+    face_ids = list(session.scalars(select(Face.id).where(Face.image_id == image_id)))
+    if face_ids:
+        session.execute(
+            update(Person)
+            .where(Person.cover_face_id.in_(face_ids))
+            .values(cover_face_id=None)
+        )
+    session.execute(delete(Face).where(Face.image_id == image_id))
+
+
 def _worker_result(
     image: Image,
     *,
@@ -292,7 +323,7 @@ def persist_worker_response(
                 values = None
                 error_text = _worker_error_text(exc)
 
-        session.execute(delete(Face).where(Face.image_id == image.id))
+        _delete_image_faces(session, image.id)
         if values is None:
             image.face_count = 0
             image.status = "error"
@@ -350,7 +381,7 @@ def _mark_error(session, image: Image, exc: Exception) -> None:
     session.rollback()
     current = session.scalar(select(Image).where(Image.id == image.id))
     if current is not None:
-        session.execute(delete(Face).where(Face.image_id == current.id))
+        _delete_image_faces(session, current.id)
         current.face_count = 0
         current.status = "error"
         current.error = f"{type(exc).__name__}: {exc}"[:4000]
@@ -368,14 +399,307 @@ def _cluster_summary(session) -> ClusterReport:
     )
 
 
-def _rebuild_person_clusters(session) -> ClusterReport:
-    """Rebuild clusters while retaining named persons as stable identities."""
-    named_persons = list(session.scalars(select(Person).where(Person.name.is_not(None))))
-    faces = list(
+def _cosine_similarity(left, right) -> float:
+    left_norm = sum(float(value) * float(value) for value in left) ** 0.5
+    right_norm = sum(float(value) * float(value) for value in right) ** 0.5
+    if not left_norm or not right_norm:
+        return 0.0
+    return sum(float(a) * float(b) for a, b in zip(left, right)) / (left_norm * right_norm)
+
+
+def _centroid(faces: Sequence[Face]) -> list[float]:
+    dimensions = len(faces[0].embedding)
+    return [
+        sum(float(face.embedding[index]) for face in faces) / len(faces)
+        for index in range(dimensions)
+    ]
+
+
+def _group_for_face(session, face_id: int, root: str | Path | None) -> tuple[Face, Person, list[Face]]:
+    face = session.scalar(select(Face).where(Face.id == face_id))
+    if face is None:
+        raise ValueError(f"Face {face_id} no longer exists")
+    image = session.get(Image, face.image_id)
+    if image is None:
+        raise ValueError(f"Image for face {face_id} no longer exists")
+    selected_root = active_root(root)
+    try:
+        Path(image.path).resolve().relative_to(selected_root.resolve())
+    except ValueError as exc:
+        raise ValueError(f"Face {face_id} is outside the selected image root") from exc
+    if face.person_id is None:
+        raise ValueError(f"Face {face_id} is ungrouped DBSCAN noise and cannot be labelled")
+    person = session.scalar(
+        select(Person)
+        .where(Person.id == face.person_id)
+        .execution_options(populate_existing=True)
+    )
+    if person is None:
+        raise ValueError(f"Face {face_id} no longer belongs to an available group")
+    group = list(
         session.scalars(
-            select(Face).where(Face.embedding.is_not(None)).order_by(Face.id)
+            select(Face)
+            .where(Face.person_id == person.id)
+            .order_by(Face.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
     )
+    selected_face = next((member for member in group if member.id == face_id), None)
+    if selected_face is None:
+        raise ValueError(f"Face group containing {face_id} changed concurrently")
+    face = selected_face
+    person = session.scalar(
+        select(Person)
+        .where(Person.id == person.id)
+        .execution_options(populate_existing=True)
+    )
+    if person is None:
+        raise ValueError(f"Face {face_id} no longer belongs to an available group")
+    if person.name is not None:
+        return face, person, group
+    if not group or any(member.embedding is None for member in group):
+        raise ValueError(f"Face {face_id} does not belong to a labelable analyser group")
+    return face, person, group
+
+
+def _decisions_for_group(session, group: Sequence[Face]) -> dict[tuple[int, int], FaceMatchDecision]:
+    face_ids = [face.id for face in group]
+    if not face_ids:
+        return {}
+    decisions = session.scalars(
+        select(FaceMatchDecision)
+        .where(FaceMatchDecision.face_id.in_(face_ids))
+        .with_for_update()
+    )
+    return {(decision.face_id, decision.target_person_id): decision for decision in decisions}
+
+
+def _assign_group_to_person(
+    session,
+    group: Sequence[Face],
+    source_person: Person,
+    target: Person,
+) -> GroupLabelResult:
+    if target.name is None:
+        raise ValueError("The target person must have a name")
+    decisions = _decisions_for_group(session, group)
+    rejected = [
+        decision
+        for decision in decisions.values()
+        if decision.target_person_id == target.id and decision.status == "rejected"
+    ]
+    if rejected:
+        raise ValueError(
+            f"This face group was rejected as {target.name!r}; it cannot be assigned to that identity"
+        )
+    other_accepted = [
+        decision
+        for decision in decisions.values()
+        if decision.status == "accepted" and decision.target_person_id != target.id
+    ]
+    if other_accepted:
+        raise ValueError("This face group is already accepted as a different named person")
+
+    existing_faces = list(
+        session.scalars(
+            select(Face)
+            .where(Face.person_id == target.id, Face.embedding.is_not(None))
+            .order_by(Face.id)
+        )
+    )
+    combined_faces = existing_faces + list(group)
+    centroid = _centroid(combined_faces)
+    for face in group:
+        decision = decisions.get((face.id, target.id))
+        if decision is None:
+            session.add(
+                FaceMatchDecision(face_id=face.id, target_person_id=target.id, status="accepted")
+            )
+        else:
+            decision.status = "accepted"
+        face.person_id = target.id
+    target.embedding = centroid
+    target.cover_face_id = (existing_faces or list(group))[0].id
+    session.flush()
+    if source_person.id != target.id and source_person.name is None:
+        session.delete(source_person)
+    return GroupLabelResult(target.id, target.name, len(group))
+
+
+def label_face_group(
+    face_id: int,
+    name: str,
+    *,
+    root: str | Path | None = None,
+    session_factory=SessionLocal,
+) -> GroupLabelResult:
+    """Give a new exact-case-sensitive name to the analyser group containing ``face_id``.
+
+    DBSCAN noise cannot be labelled. The decision is persisted against every
+    stable face ID in the group so subsequent cluster rebuilds retain it.
+    """
+    if not name or not name.strip():
+        raise ValueError("Person name cannot be empty")
+    try:
+        with session_factory() as session:
+            _, source_person, group = _group_for_face(session, face_id, root)
+            if source_person.name is not None:
+                if source_person.name == name:
+                    return GroupLabelResult(source_person.id, source_person.name, len(group))
+                raise ValueError("This face already belongs to a named person")
+            duplicate = session.scalar(select(Person).where(Person.name == name))
+            if duplicate is not None:
+                raise ValueError(f"Person name {name!r} is already in use")
+            target = Person(name=name, embedding=_centroid(group), cover_face_id=group[0].id)
+            session.add(target)
+            session.flush()
+            result = _assign_group_to_person(session, group, source_person, target)
+            session.commit()
+            return result
+    except IntegrityError as exc:
+        raise ValueError(f"Person name {name!r} is already in use or the group changed concurrently") from exc
+
+
+def assign_face_group_to_person(
+    face_id: int,
+    target_person_id: int,
+    *,
+    root: str | Path | None = None,
+    session_factory=SessionLocal,
+) -> GroupLabelResult:
+    """Explicitly assign a current analyser group to an existing named person.
+
+    This API enforces persisted rejections and is intended for deliberate
+    service-side assignment; it does not bypass a rejected group/identity pair.
+    """
+    try:
+        with session_factory() as session:
+            target = session.scalar(
+                select(Person).where(Person.id == target_person_id).with_for_update()
+            )
+            if target is None or target.name is None:
+                raise ValueError(f"Named person {target_person_id} does not exist")
+            _, source_person, group = _group_for_face(session, face_id, root)
+            if source_person.name is not None:
+                if source_person.id == target.id:
+                    return GroupLabelResult(target.id, target.name, len(group))
+                raise ValueError("This face already belongs to a different named person")
+            result = _assign_group_to_person(session, group, source_person, target)
+            session.commit()
+            return result
+    except IntegrityError as exc:
+        raise ValueError("The group could not be assigned because its identity changed concurrently") from exc
+
+
+def accept_face_match_proposal(
+    face_id: int,
+    target_person_id: int,
+    *,
+    root: str | Path | None = None,
+    session_factory=SessionLocal,
+) -> GroupLabelResult:
+    """Accept a pending group proposal and merge the full group to its canonical person."""
+    try:
+        with session_factory() as session:
+            target = session.scalar(
+                select(Person).where(Person.id == target_person_id).with_for_update()
+            )
+            if target is None or target.name is None:
+                raise ValueError(f"Named person {target_person_id} does not exist")
+            _, source_person, group = _group_for_face(session, face_id, root)
+            if source_person.id == target.id:
+                return GroupLabelResult(target.id, target.name, len(group))
+            decisions = _decisions_for_group(session, group)
+            if any(
+                decision.target_person_id == target.id and decision.status == "rejected"
+                for decision in decisions.values()
+            ):
+                raise ValueError(f"This face group was rejected as {target.name!r}")
+            if not any(
+                decision.target_person_id == target.id
+                and decision.status in ("proposed", "accepted")
+                for decision in decisions.values()
+            ):
+                raise ValueError("No pending proposal exists for this face group and named person")
+            if source_person.name is not None and source_person.id != target.id:
+                raise ValueError("This face group already belongs to a different named person")
+            result = _assign_group_to_person(session, group, source_person, target)
+            session.commit()
+            return result
+    except IntegrityError as exc:
+        raise ValueError("The proposal could not be accepted because the group changed concurrently") from exc
+
+
+def reject_face_match_proposal(
+    face_id: int,
+    target_person_id: int,
+    *,
+    root: str | Path | None = None,
+    session_factory=SessionLocal,
+) -> FaceMatchResolutionResult:
+    """Persist a hard group-to-person exclusion for a pending proposal."""
+    try:
+        with session_factory() as session:
+            target = session.scalar(
+                select(Person).where(Person.id == target_person_id).with_for_update()
+            )
+            if target is None or target.name is None:
+                raise ValueError(f"Named person {target_person_id} does not exist")
+            _, source_person, group = _group_for_face(session, face_id, root)
+            if source_person.name is not None:
+                raise ValueError("A named face group cannot be rejected as another person")
+            decisions = _decisions_for_group(session, group)
+            if any(
+                decision.target_person_id == target.id and decision.status == "accepted"
+                for decision in decisions.values()
+            ):
+                raise ValueError(f"This face group was already accepted as {target.name!r}")
+            if not any(
+                decision.target_person_id == target.id
+                and decision.status in ("proposed", "rejected")
+                for decision in decisions.values()
+            ):
+                raise ValueError("No pending proposal exists for this face group and named person")
+            for face in group:
+                decision = decisions.get((face.id, target.id))
+                if decision is None:
+                    session.add(
+                        FaceMatchDecision(face_id=face.id, target_person_id=target.id, status="rejected")
+                    )
+                else:
+                    decision.status = "rejected"
+            session.commit()
+            return FaceMatchResolutionResult(face_id, target.id, "rejected", len(group))
+    except IntegrityError as exc:
+        raise ValueError("The proposal could not be rejected because the group changed concurrently") from exc
+
+
+def _rebuild_person_clusters(session) -> ClusterReport:
+    """Rebuild clusters while retaining named persons as stable identities."""
+    named_persons = list(
+        session.scalars(select(Person).where(Person.name.is_not(None)).with_for_update())
+    )
+    faces = list(
+        session.scalars(
+            select(Face)
+            .where(Face.embedding.is_not(None))
+            .order_by(Face.id)
+            .with_for_update()
+        )
+    )
+
+    decisions = list(
+        session.scalars(select(FaceMatchDecision).with_for_update())
+    )
+    decisions_by_key = {
+        (decision.face_id, decision.target_person_id): decision for decision in decisions
+    }
+    named_by_id = {person.id: person for person in named_persons}
+    named_embeddings = {
+        person.id: list(person.embedding) if person.embedding is not None else None
+        for person in named_persons
+    }
 
     session.execute(update(Face).values(person_id=None))
     session.execute(update(Person).values(cover_face_id=None))
@@ -393,43 +717,84 @@ def _rebuild_person_clusters(session) -> ClusterReport:
         metric="cosine",
     ).fit_predict(embeddings)
 
-    available_named = list(named_persons)
     threshold = float(config.get("analysis", {}).get("similarity_threshold", 0.6))
-
-    def cosine(left, right) -> float:
-        left_norm = sum(float(value) * float(value) for value in left) ** 0.5
-        right_norm = sum(float(value) * float(value) for value in right) ** 0.5
-        if not left_norm or not right_norm:
-            return 0.0
-        return sum(float(a) * float(b) for a, b in zip(left, right)) / (left_norm * right_norm)
+    named_group_faces: dict[int, list[Face]] = {}
 
     for label in sorted(set(labels)):
         if label == -1:
             continue
         cluster_faces = [face for face, face_label in zip(faces, labels) if face_label == label]
-        centroid = [
-            sum(float(face.embedding[index]) for face in cluster_faces) / len(cluster_faces)
-            for index in range(512)
-        ]
+        centroid = _centroid(cluster_faces)
+        cluster_ids = {face.id for face in cluster_faces}
+        statuses_by_target: dict[int, set[str]] = {}
+        for (decision_face_id, target_id), decision in decisions_by_key.items():
+            if decision_face_id in cluster_ids:
+                statuses_by_target.setdefault(target_id, set()).add(decision.status)
+        rejected_targets = {
+            target_id
+            for target_id, statuses in statuses_by_target.items()
+            if "rejected" in statuses
+        }
+        accepted_targets = {
+            target_id
+            for target_id, statuses in statuses_by_target.items()
+            if "accepted" in statuses and target_id not in rejected_targets
+        }
         person = None
-        best = None
-        for candidate in available_named:
-            if candidate.embedding is None:
-                continue
-            similarity = cosine(candidate.embedding, centroid)
-            if best is None or similarity > best[0]:
-                best = (similarity, candidate)
-        if best is not None and best[0] >= threshold:
-            person = best[1]
-            available_named.remove(person)
-            person.embedding = centroid
-            person.cover_face_id = cluster_faces[0].id
-        else:
+        if len(accepted_targets) == 1:
+            person = named_by_id.get(next(iter(accepted_targets)))
+        elif len(accepted_targets) > 1:
+            raise ValueError(
+                "A DBSCAN group contains accepted decisions for multiple named people; "
+                "resolve the conflicting labels before rebuilding clusters"
+            )
+
+        if person is None:
             person = Person(embedding=centroid, cover_face_id=cluster_faces[0].id)
             session.add(person)
             session.flush()
+        else:
+            named_group_faces.setdefault(person.id, []).extend(cluster_faces)
         for face in cluster_faces:
             face.person_id = person.id
+
+        if len(accepted_targets) == 1 and person.name is not None:
+            continue
+
+        existing_proposals = {
+            target_id
+            for target_id, statuses in statuses_by_target.items()
+            if "proposed" in statuses and target_id not in rejected_targets
+        }
+        proposed_targets = set(existing_proposals)
+        for candidate in named_persons:
+            candidate_embedding = named_embeddings.get(candidate.id)
+            if candidate_embedding is None or candidate.id in rejected_targets:
+                continue
+            if _cosine_similarity(candidate_embedding, centroid) >= threshold:
+                proposed_targets.add(candidate.id)
+
+        for target_id in proposed_targets:
+            if target_id not in named_by_id:
+                continue
+            for face in cluster_faces:
+                key = (face.id, target_id)
+                decision = decisions_by_key.get(key)
+                if decision is None:
+                    decision = FaceMatchDecision(
+                        face_id=face.id,
+                        target_person_id=target_id,
+                        status="proposed",
+                    )
+                    session.add(decision)
+                    decisions_by_key[key] = decision
+                elif decision.status == "proposed":
+                    continue
+
+    for person_id, assigned_faces in named_group_faces.items():
+        person = named_by_id[person_id]
+        person.embedding = _centroid(assigned_faces)
+        person.cover_face_id = min(assigned_faces, key=lambda face: face.id).id
     session.commit()
     return _cluster_summary(session)
 
@@ -552,7 +917,7 @@ def analyse_images(
                 if model_error is not None:
                     raise model_error
                 values = [_face_values(item) for item in _represent(Path(image.path), model)]
-                session.execute(delete(Face).where(Face.image_id == image.id))
+                _delete_image_faces(session, image.id)
                 for x, y, width, height, confidence, embedding in values:
                     if width <= 0 or height <= 0:
                         continue
