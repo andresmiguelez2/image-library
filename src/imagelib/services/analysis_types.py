@@ -11,7 +11,7 @@ class AnalysisReport:
     analysed: int = 0
     faces: int = 0
     errors: int = 0
-    results: tuple["WorkerAnalysisResult", ...] = ()
+    results: tuple[WorkerAnalysisResult, ...] = ()
 
 
 @dataclass(frozen=True)

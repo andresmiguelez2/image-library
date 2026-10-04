@@ -11,8 +11,15 @@ from sqlalchemy import delete, select, update
 from imagelib.db.models import Face, Image, Person
 from imagelib.db.session import SessionLocal
 from imagelib.diagnostics import diagnostic
-from imagelib.services.analysis_clustering import _cluster_summary, rebuild_person_clusters
-from imagelib.services.analysis_types import AnalysisTarget, WorkerAnalysisResult, WorkerBatchReport
+from imagelib.services.analysis_clustering import (
+    _cluster_summary,
+    rebuild_person_clusters,
+)
+from imagelib.services.analysis_types import (
+    AnalysisTarget,
+    WorkerAnalysisResult,
+    WorkerBatchReport,
+)
 from imagelib.services.scanner import sha256_file
 
 
