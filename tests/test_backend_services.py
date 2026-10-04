@@ -230,99 +230,129 @@ def test_catalog_browser_calendar_detail_and_counts(tmp_path):
     assert counts["analysed"] == 1 and counts["indexed"] == 1
 
 
-def test_calendar_groups_sort_effective_timestamps_and_leave_unknown_last(tmp_path):
+def test_catalog_person_groups_and_any_all_search_are_root_scoped(tmp_path):
     factory = database()
     root = tmp_path / "images"
-    root.mkdir()
+    outside = tmp_path / "outside"
+    (root / "a").mkdir(parents=True)
+    (root / "b").mkdir()
+    outside.mkdir()
+    paths = {
+        "combined": root / "a" / "combined.jpg",
+        "ada": root / "b" / "ada.jpg",
+        "unnamed": root / "unnamed.jpg",
+        "ungrouped": root / "unassigned.jpg",
+        "outside": outside / "outside.jpg",
+    }
+    dates = {
+        "combined": datetime(2026, 2, 1, 12),
+        "ada": datetime(2026, 2, 2, 12),
+        "unnamed": datetime(2026, 2, 3, 12),
+        "ungrouped": datetime(2026, 2, 4, 12),
+        "outside": datetime(2026, 2, 5, 12),
+    }
     with factory() as session:
         source = Source(path=str(root))
-        session.add(source)
+        outside_source = Source(path=str(outside))
+        ada = Person(name="Ada")
+        unnamed = Person()
+        outside_only = Person(name="Outside only")
+        session.add_all([source, outside_source, ada, unnamed, outside_only])
         session.flush()
-
-        def make_image(filename, *, taken_at=None, modified_at=None):
-            return Image(
-                source_id=source.id,
-                path=str(root / filename),
-                content_hash=filename,
-                taken_at=taken_at,
-                modified_at=modified_at,
+        images = {}
+        for label, path in paths.items():
+            images[label] = Image(
+                source_id=outside_source.id if label == "outside" else source.id,
+                path=str(path),
+                content_hash=label,
+                thumb_path=f"thumbs/{label}.jpg",
+                taken_at=dates[label],
+                face_count=2 if label == "combined" else 1,
             )
-
-        session.add_all(
-            [
-                make_image("z-tie.jpg", taken_at=datetime(2024, 3, 4, 9)),
-                make_image(
-                    "late-taken.jpg",
-                    taken_at=datetime(2024, 3, 4, 10),
-                    modified_at=datetime(2024, 3, 4, 6),
-                ),
-                make_image("next-day.jpg", modified_at=datetime(2024, 3, 5, 8)),
-                make_image("unknown.jpg"),
-                make_image("fallback.jpg", modified_at=datetime(2024, 3, 4, 8)),
-                make_image(
-                    "early-taken.jpg",
-                    taken_at=datetime(2024, 3, 4, 7),
-                    modified_at=datetime(2024, 3, 5, 1),
-                ),
-                make_image("a-tie.jpg", taken_at=datetime(2024, 3, 4, 9)),
-            ]
-        )
+        session.add_all(images.values())
+        session.flush()
+        faces = [
+            Face(image_id=images["combined"].id, person_id=ada.id, x=1, y=2, w=3, h=4),
+            Face(image_id=images["combined"].id, person_id=unnamed.id, x=5, y=6, w=7, h=8),
+            Face(image_id=images["ada"].id, person_id=ada.id, x=9, y=10, w=11, h=12),
+            Face(image_id=images["unnamed"].id, person_id=unnamed.id, x=13, y=14, w=15, h=16),
+            Face(image_id=images["ungrouped"].id, person_id=None, x=17, y=18, w=19, h=20),
+            Face(image_id=images["outside"].id, person_id=ada.id, x=21, y=22, w=23, h=24),
+            Face(image_id=images["outside"].id, person_id=outside_only.id, x=25, y=26, w=27, h=28),
+        ]
+        session.add_all(faces)
+        session.flush()
+        ada.cover_face_id = faces[5].id
         session.commit()
+        ada_id = ada.id
+        unnamed_id = unnamed.id
 
-    groups = catalog.calendar_groups(root=root, session_factory=factory)
+    groups = catalog.list_person_groups(root=root, session_factory=factory)
+    by_id = {group.person_id: group for group in groups}
+    assert set(by_id) == {ada_id, unnamed_id}
+    ada_group = by_id[ada_id]
+    assert ada_group.name == "Ada"
+    assert ada_group.face_count == 2 and ada_group.image_count == 2
+    assert ada_group.representative_image_path == str(paths["combined"])
+    assert ada_group.representative_thumbnail_path == "thumbs/combined.jpg"
+    assert (
+        ada_group.representative_face_x,
+        ada_group.representative_face_y,
+        ada_group.representative_face_w,
+        ada_group.representative_face_h,
+    ) == (1, 2, 3, 4)
+    assert by_id[unnamed_id].name is None
+    assert by_id[unnamed_id].face_count == 2 and by_id[unnamed_id].image_count == 2
 
-    assert list(groups) == [date(2024, 3, 4), date(2024, 3, 5), None]
-    assert [item.relative_path for item in groups[date(2024, 3, 4)]] == [
-        "early-taken.jpg",
-        "fallback.jpg",
-        "a-tie.jpg",
-        "z-tie.jpg",
-        "late-taken.jpg",
+    any_rows = catalog.list_images(
+        root=root, persons=[ada_id, unnamed_id], session_factory=factory
+    )
+    all_rows = catalog.list_images(
+        root=root,
+        persons=[ada_id, unnamed_id],
+        person_match="all",
+        session_factory=factory,
+    )
+    assert [Path(row.path).name for row in any_rows] == [
+        "combined.jpg",
+        "ada.jpg",
+        "unnamed.jpg",
     ]
-    assert [item.relative_path for item in groups[date(2024, 3, 5)]] == ["next-day.jpg"]
-    assert [item.relative_path for item in groups[None]] == ["unknown.jpg"]
-
-
-def test_calendar_groups_sort_mixed_timezone_timestamps_safely(tmp_path, monkeypatch):
-    root = tmp_path / "images"
-    root.mkdir()
-
-    def make_row(image_id, filename, taken_at):
-        return SimpleNamespace(
-            id=image_id,
-            path=str(root / filename),
-            taken_at=taken_at,
-            modified_at=None,
-            thumb_path=None,
-            width=None,
-            height=None,
-            face_count=0,
-            status="indexed",
+    assert len({row.id for row in any_rows}) == len(any_rows)
+    assert [Path(row.path).name for row in all_rows] == ["combined.jpg"]
+    assert [
+        Path(row.path).name
+        for row in catalog.list_images(
+            root=root,
+            directory="a",
+            persons=[ada_id, unnamed_id],
+            person_match="all",
+            session_factory=factory,
         )
+    ] == ["combined.jpg"]
+    assert catalog.list_images(
+        root=root,
+        directory="b",
+        persons=[ada_id, unnamed_id],
+        person_match="all",
+        session_factory=factory,
+    ) == []
+    assert [
+        Path(row.path).name
+        for row in catalog.list_images(
+            root=root, persons=["Ada"], session_factory=factory
+        )
+    ] == ["combined.jpg", "ada.jpg"]
 
-    rows = [
-        make_row(1, "z-tie.jpg", datetime(2024, 3, 4, 10, tzinfo=timezone.utc)),
-        make_row(2, "naive.jpg", datetime(2024, 3, 4, 9)),
-        make_row(
-            3,
-            "offset-early.jpg",
-            datetime(2024, 3, 4, 10, tzinfo=timezone(timedelta(hours=2))),
-        ),
-        make_row(
-            4,
-            "a-tie.jpg",
-            datetime(2024, 3, 4, 11, tzinfo=timezone(timedelta(hours=1))),
-        ),
-    ]
-    monkeypatch.setattr(catalog, "_images_in_root", lambda _session, _root: rows)
-
-    groups = catalog.calendar_groups(root=root, session_factory=nullcontext)
-
-    assert [item.relative_path for item in groups[date(2024, 3, 4)]] == [
-        "offset-early.jpg",
-        "naive.jpg",
-        "a-tie.jpg",
-        "z-tie.jpg",
+    calendar = catalog.calendar_groups(
+        root=root,
+        persons=[ada_id, unnamed_id],
+        person_match="all",
+        session_factory=factory,
+    )
+    assert list(calendar) == [datetime(2026, 2, 1).date()]
+    assert [Path(row.path).name for rows in calendar.values() for row in rows] == [
+        "combined.jpg"
     ]
 
 

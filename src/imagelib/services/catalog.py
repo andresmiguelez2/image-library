@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, datetime, time, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Literal
 
-from sqlalchemy import or_, select
+from sqlalchemy import select
 from sqlalchemy.orm import aliased
 
 from imagelib.config import active_root
@@ -31,6 +32,24 @@ class ImageListItem:
     height: int | None
     face_count: int
     status: str
+
+
+@dataclass(frozen=True)
+class PersonGroup:
+    """A person represented by faces under the active root."""
+
+    person_id: int
+    name: str | None
+    face_count: int
+    image_count: int
+    representative_face_id: int
+    representative_face_x: float
+    representative_face_y: float
+    representative_face_w: float
+    representative_face_h: float
+    representative_image_id: int
+    representative_image_path: str
+    representative_thumbnail_path: str | None
 
 
 @dataclass(frozen=True)
@@ -151,6 +170,56 @@ def _images_in_root(session, root: Path) -> list[Image]:
     ]
 
 
+def list_person_groups(
+    *, root: str | Path | None = None, session_factory=SessionLocal
+) -> list[PersonGroup]:
+    """List person groups with root-scoped counts and an in-root sample face."""
+    selected_root = _root(root)
+    with session_factory() as session:
+        images = _images_in_root(session, selected_root)
+        image_ids = {image.id for image in images}
+        if not image_ids:
+            return []
+
+        names: dict[int, str | None] = {}
+        face_counts: Counter[int] = Counter()
+        image_ids_by_person: dict[int, set[int]] = {}
+        samples: dict[int, tuple[Face, Image]] = {}
+        rows = session.execute(
+            select(Face, Person, Image)
+            .join(Person, Person.id == Face.person_id)
+            .join(Image, Image.id == Face.image_id)
+            .where(Face.person_id.is_not(None), Face.image_id.in_(image_ids))
+            .order_by(Face.person_id, Face.id)
+        ).all()
+        for face, person, image in rows:
+            names.setdefault(person.id, person.name)
+            face_counts[person.id] += 1
+            image_ids_by_person.setdefault(person.id, set()).add(image.id)
+            samples.setdefault(person.id, (face, image))
+
+        result = []
+        for person_id in sorted(names):
+            face, image = samples[person_id]
+            result.append(
+                PersonGroup(
+                    person_id=person_id,
+                    name=names[person_id],
+                    face_count=face_counts[person_id],
+                    image_count=len(image_ids_by_person[person_id]),
+                    representative_face_id=face.id,
+                    representative_face_x=face.x,
+                    representative_face_y=face.y,
+                    representative_face_w=face.w,
+                    representative_face_h=face.h,
+                    representative_image_id=image.id,
+                    representative_image_path=image.path,
+                    representative_thumbnail_path=image.thumb_path,
+                )
+            )
+        return result
+
+
 def filter_images(
     *,
     persons: Iterable[int | str] | None = None,
@@ -158,6 +227,7 @@ def filter_images(
     date_from: datetime | date | None = None,
     date_to: datetime | date | None = None,
     face_count: int | bool | None = None,
+    person_match: Literal["any", "all"] = "any",
     root: str | Path | None = None,
     session_factory=SessionLocal,
 ) -> list[Image]:
@@ -165,9 +235,12 @@ def filter_images(
 
     ``root`` scopes results to the active root.  The returned rows are fully
     scalar-loaded and can be converted with :func:`list_images` for UI use.
-    ``persons`` accepts person IDs and/or names; ``locations`` matches
-    ``gps_place``.  A true ``face_count`` asks for images containing faces.
+    ``persons`` accepts person IDs and/or names; ``person_match`` controls
+    whether any or all selected people must appear. ``locations`` matches
+    ``gps_place``. A true ``face_count`` asks for images containing faces.
     """
+    if person_match not in {"any", "all"}:
+        raise ValueError("person_match must be 'any' or 'all'")
     selected_root = _root(root)
     with session_factory() as session:
         images = _images_in_root(session, selected_root)
@@ -175,6 +248,9 @@ def filter_images(
         location_values = set(locations or [])
         person_ids = {value for value in person_values if isinstance(value, int)}
         person_names = {value for value in person_values if isinstance(value, str)}
+        selected_values = {("id", value) for value in person_ids} | {
+            ("name", value) for value in person_names
+        }
         result = []
         lower_bound = (
             datetime.combine(date_from, time.min) if isinstance(date_from, date) and not isinstance(date_from, datetime) else date_from
@@ -194,18 +270,24 @@ def filter_images(
             if location_values and image.gps_place not in location_values:
                 continue
             if person_values:
-                matching = session.scalars(
-                    select(Face)
-                    .join(Person, isouter=True)
-                    .where(
-                        Face.image_id == image.id,
-                        or_(
-                            Face.person_id.in_(person_ids) if person_ids else False,
-                            Person.name.in_(person_names) if person_names else False,
-                        ),
-                    )
-                ).first()
-                if matching is None:
+                if not selected_values:
+                    continue
+                matching_people = session.execute(
+                    select(Face.person_id, Person.name)
+                    .join(Person, Person.id == Face.person_id)
+                    .where(Face.image_id == image.id)
+                ).all()
+                matched_values = set()
+                for person_id, person_name in matching_people:
+                    if person_id in person_ids:
+                        matched_values.add(("id", person_id))
+                    if person_name in person_names:
+                        matched_values.add(("name", person_name))
+                if person_match == "all":
+                    matches = selected_values.issubset(matched_values)
+                else:
+                    matches = not selected_values.isdisjoint(matched_values)
+                if not matches:
                     continue
             result.append(image)
         return result
@@ -220,6 +302,7 @@ def list_images(
     date_from: datetime | date | None = None,
     date_to: datetime | date | None = None,
     face_count: int | bool | None = None,
+    person_match: Literal["any", "all"] = "any",
     offset: int = 0,
     limit: int | None = None,
     session_factory=SessionLocal,
@@ -232,6 +315,7 @@ def list_images(
         date_from=date_from,
         date_to=date_to,
         face_count=face_count,
+        person_match=person_match,
         root=selected_root,
         session_factory=session_factory,
     )
@@ -265,19 +349,34 @@ def list_browser_images(**kwargs) -> list[ImageListItem]:
 
 
 def calendar_groups(
-    *, root: str | Path | None = None, session_factory=SessionLocal
+    *,
+    root: str | Path | None = None,
+    persons: Iterable[int | str] | None = None,
+    locations: Iterable[str] | None = None,
+    date_from: datetime | date | None = None,
+    date_to: datetime | date | None = None,
+    face_count: int | bool | None = None,
+    person_match: Literal["any", "all"] = "any",
+    session_factory=SessionLocal,
 ) -> dict[date | None, list[ImageListItem]]:
-    """Group images by capture date, falling back to file modification date."""
+    """Filter root images, then group by capture date or file modification date."""
     selected_root = _root(root)
-    with session_factory() as session:
-        groups: dict[date | None, list[ImageListItem]] = {}
-        for image in _images_in_root(session, selected_root):
-            timestamp = image.taken_at or image.modified_at
-            group = timestamp.date() if timestamp is not None else None
-            groups.setdefault(group, []).append(_list_item(image, selected_root))
-        for images in groups.values():
-            images.sort(key=_calendar_item_sort_key)
-        return dict(sorted(groups.items(), key=lambda item: (item[0] is None, item[0] or date.min)))
+    images = filter_images(
+        persons=persons,
+        locations=locations,
+        date_from=date_from,
+        date_to=date_to,
+        face_count=face_count,
+        person_match=person_match,
+        root=selected_root,
+        session_factory=session_factory,
+    )
+    groups: dict[date | None, list[ImageListItem]] = {}
+    for image in images:
+        timestamp = image.taken_at or image.modified_at
+        group = timestamp.date() if timestamp is not None else None
+        groups.setdefault(group, []).append(_list_item(image, selected_root))
+    return dict(sorted(groups.items(), key=lambda item: (item[0] is None, item[0] or date.min)))
 
 
 def group_images_by_date(**kwargs) -> dict[date | None, list[ImageListItem]]:
