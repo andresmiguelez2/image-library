@@ -24,6 +24,7 @@ from typing import IO, Callable
 
 from imagelib.config import config
 from imagelib.diagnostics import diagnostic, diagnostic_exception
+from typing_extensions import Self
 
 
 def _default_model_factory():
@@ -170,7 +171,7 @@ class DeepFaceWorkerClient:
             self.process.terminate()
             self.process.wait(timeout=5)
 
-    def __enter__(self) -> "DeepFaceWorkerClient":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *_exc) -> None:
