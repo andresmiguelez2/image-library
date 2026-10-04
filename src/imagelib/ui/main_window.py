@@ -2442,6 +2442,7 @@ class MainWindow(QMainWindow):
         self.calendar_stack = QStackedWidget()
         self.calendar_stack.addWidget(self.browser)
         self.calendar_stack.addWidget(self.calendar)
+        self.calendar_stack.addWidget(self.chronological)
         self.people_view = PeopleView(self)
         self.people_view.apply_requested.connect(self._apply_people_filter)
         self.people_view.back_requested.connect(self._cancel_people_picker)
