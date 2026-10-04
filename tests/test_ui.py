@@ -7,8 +7,8 @@ from pathlib import Path
 import pytest
 
 try:
-    from PySide6.QtCore import QPoint, QPointF, QProcess, QRect, Qt, QThreadPool
-    from PySide6.QtGui import QImage, QPainter, QPixmap, QWheelEvent
+    from PySide6.QtCore import QEvent, QPoint, QPointF, QProcess, QRect, Qt, QThreadPool
+    from PySide6.QtGui import QImage, QMouseEvent, QPainter, QPixmap, QWheelEvent
     from PySide6.QtTest import QTest
     from PySide6.QtWidgets import QApplication, QStyleOptionViewItem
 except (ImportError, OSError):
@@ -137,6 +137,135 @@ def test_detail_face_rectangles_preserve_letterbox_geometry(application):
     assert rectangle == QRect(46, 112, 77, 96)
     widget.set_visualisation(False)
     assert widget._visualise is False
+
+
+def test_detail_image_zoom_is_cursor_anchored_and_face_rectangles_follow(application):
+    widget = FaceImageWidget()
+    widget.resize(400, 300)
+
+    class Face:
+        x, y, w, h = 20, 30, 40, 50
+
+    widget.set_asset(QPixmap(200, 100), (Face(),))
+    before = widget._display_rect()
+    point = QPointF(120, 120)
+    wheel = QWheelEvent(
+        point,
+        QPointF(widget.mapToGlobal(point.toPoint())),
+        QPoint(0, 0),
+        QPoint(0, 120),
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+        Qt.ScrollPhase.ScrollUpdate,
+        False,
+    )
+    QApplication.sendEvent(widget, wheel)
+
+    after = widget._display_rect()
+    assert widget._zoom == pytest.approx(1.2)
+    assert (point.x() - before.left()) / before.width() == pytest.approx(
+        (point.x() - after.left()) / after.width(), abs=0.01
+    )
+    face_rect = widget.face_rects()[0]
+    assert face_rect == QRect(
+        round(after.left() + Face.x * after.width() / 200),
+        round(after.top() + Face.y * after.height() / 100),
+        max(1, round(Face.w * after.width() / 200)),
+        max(1, round(Face.h * after.height() / 100)),
+    )
+
+    wheel_down = QWheelEvent(
+        point,
+        QPointF(widget.mapToGlobal(point.toPoint())),
+        QPoint(0, 0),
+        QPoint(0, -1200),
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+        Qt.ScrollPhase.ScrollUpdate,
+        False,
+    )
+    QApplication.sendEvent(widget, wheel_down)
+    assert widget._zoom == 1.0
+    wheel_up = QWheelEvent(
+        point,
+        QPointF(widget.mapToGlobal(point.toPoint())),
+        QPoint(0, 0),
+        QPoint(0, 3600),
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+        Qt.ScrollPhase.ScrollUpdate,
+        False,
+    )
+    QApplication.sendEvent(widget, wheel_up)
+    assert widget._zoom == 8.0
+
+
+def test_detail_image_pan_double_click_and_new_asset_reset(application):
+    widget = FaceImageWidget()
+    widget.resize(400, 300)
+
+    class Face:
+        x, y, w, h = 20, 30, 40, 50
+
+    widget.set_asset(QPixmap(200, 100), (Face(),))
+    point = QPointF(200, 150)
+    wheel = QWheelEvent(
+        point,
+        QPointF(widget.mapToGlobal(point.toPoint())),
+        QPoint(0, 0),
+        QPoint(0, 120),
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+        Qt.ScrollPhase.ScrollUpdate,
+        False,
+    )
+    QApplication.sendEvent(widget, wheel)
+    before = widget._display_rect()
+    press = QMouseEvent(
+        QEvent.Type.MouseButtonPress,
+        point,
+        QPointF(widget.mapToGlobal(point.toPoint())),
+        Qt.MouseButton.LeftButton,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    QApplication.sendEvent(widget, press)
+    movement = QPointF(20, -10)
+    moved = point + movement
+    move = QMouseEvent(
+        QEvent.Type.MouseMove,
+        moved,
+        QPointF(widget.mapToGlobal(moved.toPoint())),
+        Qt.MouseButton.NoButton,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    QApplication.sendEvent(widget, move)
+    release = QMouseEvent(
+        QEvent.Type.MouseButtonRelease,
+        moved,
+        QPointF(widget.mapToGlobal(moved.toPoint())),
+        Qt.MouseButton.LeftButton,
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    QApplication.sendEvent(widget, release)
+
+    after_pan = widget._display_rect()
+    assert after_pan.left() - before.left() == 20
+    assert after_pan.top() == before.top()
+    assert widget.face_rects()[0].left() == round(
+        after_pan.left() + Face.x * after_pan.width() / 200
+    )
+    QTest.mouseDClick(widget, Qt.MouseButton.LeftButton, pos=QPoint(200, 150))
+    assert widget._zoom == 1.0
+    assert widget._pan == QPointF()
+
+    widget._zoom_at(QPointF(200, 150), 2.0)
+    widget._pan = QPointF(12, -8)
+    widget.set_asset(QPixmap(100, 200))
+    assert widget._zoom == 1.0
+    assert widget._pan == QPointF()
 
 
 def test_calendar_model_keeps_date_groups_and_unknown_images(application):

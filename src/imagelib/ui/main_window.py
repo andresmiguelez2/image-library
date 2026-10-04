@@ -18,6 +18,7 @@ from PySide6.QtCore import (
     QModelIndex,
     QObject,
     QPoint,
+    QPointF,
     QProcess,
     QProcessEnvironment,
     QRect,
@@ -1333,30 +1334,103 @@ class FaceImageWidget(QWidget):
         self._pixmap = QPixmap()
         self._faces = ()
         self._visualise = False
+        self._zoom = 1.0
+        self._pan = QPointF()
+        self._drag_position: QPointF | None = None
+        self._drag_pan = QPointF()
         self.setMinimumSize(260, 190)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setToolTip("Scroll to zoom; drag to pan; double-click to fit")
 
     def set_asset(self, pixmap: QPixmap, faces=()) -> None:
         self._pixmap = pixmap
         self._faces = tuple(faces)
+        self.reset_view()
         self.update()
 
     def set_visualisation(self, enabled: bool) -> None:
         self._visualise = enabled
         self.update()
 
-    def _display_rect(self) -> QRect:
-        target = self._pixmap.scaled(
-            self.rect().adjusted(8, 8, -8, -8).size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
+    def resizeEvent(self, event) -> None:
+        old_size = event.oldSize()
+        new_size = event.size()
+        if old_size.width() > 0 and old_size.height() > 0:
+            self._pan = QPointF(
+                self._pan.x() * new_size.width() / old_size.width(),
+                self._pan.y() * new_size.height() / old_size.height(),
+            )
+            self._clamp_pan()
+        super().resizeEvent(event)
+
+    def _fit_rect(self) -> QRect:
+        if self._pixmap.isNull():
+            return QRect()
+        area = self.rect().adjusted(8, 8, -8, -8)
+        scale = min(area.width() / self._pixmap.width(), area.height() / self._pixmap.height())
+        target_width = max(1, round(self._pixmap.width() * scale))
+        target_height = max(1, round(self._pixmap.height() * scale))
         return QRect(
-            (self.width() - target.width()) // 2,
-            (self.height() - target.height()) // 2,
-            target.width(),
-            target.height(),
+            (self.width() - target_width) // 2,
+            (self.height() - target_height) // 2,
+            target_width,
+            target_height,
         )
+
+    def _display_rect(self) -> QRect:
+        fit = self._fit_rect()
+        if fit.isNull():
+            return fit
+        width = max(1, round(fit.width() * self._zoom))
+        height = max(1, round(fit.height() * self._zoom))
+        left = round(fit.left() + (fit.width() - width) / 2 + self._pan.x())
+        top = round(fit.top() + (fit.height() - height) / 2 + self._pan.y())
+        return QRect(left, top, width, height)
+
+    def _clamp_pan(self) -> None:
+        fit = self._fit_rect()
+        if fit.isNull():
+            self._pan = QPointF()
+            return
+        area = self.rect().adjusted(8, 8, -8, -8)
+        width = max(1, round(fit.width() * self._zoom))
+        height = max(1, round(fit.height() * self._zoom))
+        max_x = max(0.0, (width - area.width()) / 2)
+        max_y = max(0.0, (height - area.height()) / 2)
+        self._pan = QPointF(
+            max(-max_x, min(max_x, self._pan.x())),
+            max(-max_y, min(max_y, self._pan.y())),
+        )
+
+    def reset_view(self) -> None:
+        self._zoom = 1.0
+        self._pan = QPointF()
+        self._drag_position = None
+        self.unsetCursor()
+
+    def _zoom_at(self, position: QPointF, factor: float) -> None:
+        if self._pixmap.isNull():
+            return
+        old_zoom = self._zoom
+        new_zoom = max(1.0, min(8.0, old_zoom * factor))
+        if new_zoom == old_zoom:
+            return
+        old_rect = self._display_rect()
+        zoom_ratio = new_zoom / old_zoom
+        fit = self._fit_rect()
+        new_width = max(1, round(fit.width() * new_zoom))
+        new_height = max(1, round(fit.height() * new_zoom))
+        centred_left = fit.left() + (fit.width() - new_width) / 2
+        centred_top = fit.top() + (fit.height() - new_height) / 2
+        target_left = position.x() - (position.x() - old_rect.left()) * zoom_ratio
+        target_top = position.y() - (position.y() - old_rect.top()) * zoom_ratio
+        self._zoom = new_zoom
+        self._pan = QPointF(target_left - centred_left, target_top - centred_top)
+        self._clamp_pan()
+        self.setCursor(
+            Qt.CursorShape.OpenHandCursor if self._zoom > 1.0 else Qt.CursorShape.ArrowCursor
+        )
+        self.update()
 
     def face_rects(self) -> tuple[QRect, ...]:
         if self._pixmap.isNull():
@@ -1374,6 +1448,53 @@ class FaceImageWidget(QWidget):
             for face in self._faces
         )
 
+    def wheelEvent(self, event) -> None:
+        delta = event.pixelDelta().y()
+        if not delta:
+            delta = event.angleDelta().y()
+        if not delta or self._pixmap.isNull():
+            super().wheelEvent(event)
+            return
+        self._zoom_at(event.position(), 1.2 ** (delta / 120))
+        event.accept()
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self._zoom > 1.0:
+            self._drag_position = event.position()
+            self._drag_pan = QPointF(self._pan)
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._drag_position is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            movement = event.position() - self._drag_position
+            self._pan = self._drag_pan + movement
+            self._clamp_pan()
+            self.update()
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self._drag_position is not None:
+            self._drag_position = None
+            self.setCursor(
+                Qt.CursorShape.OpenHandCursor if self._zoom > 1.0 else Qt.CursorShape.ArrowCursor
+            )
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.reset_view()
+            self.update()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
         painter.fillRect(self.rect(), self.palette().color(QPalette.ColorRole.Base))
@@ -1382,9 +1503,8 @@ class FaceImageWidget(QWidget):
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Image unavailable")
             return
         target = self._display_rect()
-        painter.drawPixmap(target, self._pixmap.scaled(
-            target.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
-        ))
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.drawPixmap(target, self._pixmap, self._pixmap.rect())
         if not self._visualise:
             return
         colours = (QColor("#ffe37a"), QColor("#67e8f9"), QColor("#f0a3ff"))
