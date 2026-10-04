@@ -6,7 +6,63 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from imagelib.db.models import Base, Face, Image, Person, Source
-from imagelib.services import analyser
+from imagelib.services import (
+    analysis_clustering,
+    analysis_persistence,
+    analysis_types,
+    face_labelling,
+)
+from imagelib.services import analyser, scanner
+
+
+def test_analyser_facade_reexports_moved_service_symbols() -> None:
+    implementation_symbols = {
+        analysis_clustering: (
+            "_centroid",
+            "_cluster_summary",
+            "_cosine_similarity",
+            "_record_cluster_proposals",
+            "_rebuild_person_clusters",
+            "rebuild_person_clusters",
+        ),
+        analysis_persistence: (
+            "_delete_image_faces",
+            "_face_values",
+            "_mark_error",
+            "_path_is_under",
+            "_select_analysis_targets",
+            "_worker_error_text",
+            "_worker_result",
+            "analysis_targets",
+            "persist_worker_batch",
+            "persist_worker_faces",
+            "persist_worker_response",
+            "select_analysis_targets",
+        ),
+        analysis_types: (
+            "AnalysisReport",
+            "AnalysisTarget",
+            "ClusterReport",
+            "FaceMatchResolutionResult",
+            "GroupLabelResult",
+            "WorkerAnalysisResult",
+            "WorkerBatchReport",
+        ),
+        face_labelling: (
+            "_assign_group_to_person",
+            "_decisions_for_group",
+            "_group_for_face",
+            "accept_face_match_proposal",
+            "assign_face_group_to_person",
+            "label_face_group",
+            "reject_face_match_proposal",
+        ),
+        scanner: ("sha256_file",),
+    }
+
+    for implementation, names in implementation_symbols.items():
+        for name in names:
+            assert getattr(analyser, name) is getattr(implementation, name)
 
 
 def test_analyser_reuses_model_and_persists_faces(tmp_path: Path, monkeypatch) -> None:

@@ -11,20 +11,46 @@ from imagelib.config import config
 from imagelib.db.models import Face, Image
 from imagelib.db.session import SessionLocal
 from imagelib.services.analysis_clustering import (
+    _centroid,
+    _cluster_summary,
+    _cosine_similarity,
+    _record_cluster_proposals,
     _rebuild_person_clusters,
+    rebuild_person_clusters,
 )
 from imagelib.services.analysis_persistence import (
     _delete_image_faces,
     _face_values,
     _mark_error,
+    _path_is_under,
     _select_analysis_targets,
     _worker_error_text,
     _worker_result,
+    analysis_targets,
+    persist_worker_batch,
+    persist_worker_faces,
+    persist_worker_response,
+    select_analysis_targets,
 )
 from imagelib.services.analysis_types import (
     AnalysisReport,
+    AnalysisTarget,
+    ClusterReport,
+    FaceMatchResolutionResult,
+    GroupLabelResult,
     WorkerAnalysisResult,
+    WorkerBatchReport,
 )
+from imagelib.services.face_labelling import (
+    _assign_group_to_person,
+    _decisions_for_group,
+    _group_for_face,
+    accept_face_match_proposal,
+    assign_face_group_to_person,
+    label_face_group,
+    reject_face_match_proposal,
+)
+from imagelib.services.scanner import sha256_file
 
 _model = None
 _model_lock = Lock()
