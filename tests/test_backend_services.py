@@ -1,9 +1,10 @@
-from datetime import datetime
+from contextlib import nullcontext
+from datetime import date, datetime, timedelta, timezone
 from io import BytesIO, StringIO
 import json
 from pathlib import Path
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 from PIL import Image as PillowImage
 from sqlalchemy import create_engine, select
@@ -227,6 +228,102 @@ def test_catalog_browser_calendar_detail_and_counts(tmp_path):
     assert detail is not None and detail.faces[0].person_name == "Ada"
     assert list(groups) == [datetime(2026, 1, 2).date()]
     assert counts["analysed"] == 1 and counts["indexed"] == 1
+
+
+def test_calendar_groups_sort_effective_timestamps_and_leave_unknown_last(tmp_path):
+    factory = database()
+    root = tmp_path / "images"
+    root.mkdir()
+    with factory() as session:
+        source = Source(path=str(root))
+        session.add(source)
+        session.flush()
+
+        def make_image(filename, *, taken_at=None, modified_at=None):
+            return Image(
+                source_id=source.id,
+                path=str(root / filename),
+                content_hash=filename,
+                taken_at=taken_at,
+                modified_at=modified_at,
+            )
+
+        session.add_all(
+            [
+                make_image("z-tie.jpg", taken_at=datetime(2024, 3, 4, 9)),
+                make_image(
+                    "late-taken.jpg",
+                    taken_at=datetime(2024, 3, 4, 10),
+                    modified_at=datetime(2024, 3, 4, 6),
+                ),
+                make_image("next-day.jpg", modified_at=datetime(2024, 3, 5, 8)),
+                make_image("unknown.jpg"),
+                make_image("fallback.jpg", modified_at=datetime(2024, 3, 4, 8)),
+                make_image(
+                    "early-taken.jpg",
+                    taken_at=datetime(2024, 3, 4, 7),
+                    modified_at=datetime(2024, 3, 5, 1),
+                ),
+                make_image("a-tie.jpg", taken_at=datetime(2024, 3, 4, 9)),
+            ]
+        )
+        session.commit()
+
+    groups = catalog.calendar_groups(root=root, session_factory=factory)
+
+    assert list(groups) == [date(2024, 3, 4), date(2024, 3, 5), None]
+    assert [item.relative_path for item in groups[date(2024, 3, 4)]] == [
+        "early-taken.jpg",
+        "fallback.jpg",
+        "a-tie.jpg",
+        "z-tie.jpg",
+        "late-taken.jpg",
+    ]
+    assert [item.relative_path for item in groups[date(2024, 3, 5)]] == ["next-day.jpg"]
+    assert [item.relative_path for item in groups[None]] == ["unknown.jpg"]
+
+
+def test_calendar_groups_sort_mixed_timezone_timestamps_safely(tmp_path, monkeypatch):
+    root = tmp_path / "images"
+    root.mkdir()
+
+    def make_row(image_id, filename, taken_at):
+        return SimpleNamespace(
+            id=image_id,
+            path=str(root / filename),
+            taken_at=taken_at,
+            modified_at=None,
+            thumb_path=None,
+            width=None,
+            height=None,
+            face_count=0,
+            status="indexed",
+        )
+
+    rows = [
+        make_row(1, "z-tie.jpg", datetime(2024, 3, 4, 10, tzinfo=timezone.utc)),
+        make_row(2, "naive.jpg", datetime(2024, 3, 4, 9)),
+        make_row(
+            3,
+            "offset-early.jpg",
+            datetime(2024, 3, 4, 10, tzinfo=timezone(timedelta(hours=2))),
+        ),
+        make_row(
+            4,
+            "a-tie.jpg",
+            datetime(2024, 3, 4, 11, tzinfo=timezone(timedelta(hours=1))),
+        ),
+    ]
+    monkeypatch.setattr(catalog, "_images_in_root", lambda _session, _root: rows)
+
+    groups = catalog.calendar_groups(root=root, session_factory=nullcontext)
+
+    assert [item.relative_path for item in groups[date(2024, 3, 4)]] == [
+        "offset-early.jpg",
+        "naive.jpg",
+        "a-tie.jpg",
+        "z-tie.jpg",
+    ]
 
 
 def test_analysis_target_selection_scopes_root_and_retries_explicit_errors(tmp_path):
