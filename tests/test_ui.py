@@ -7,8 +7,9 @@ from pathlib import Path
 import pytest
 
 try:
-    from PySide6.QtCore import QProcess, QRect, Qt, QThreadPool
-    from PySide6.QtGui import QImage, QPainter, QPixmap
+    from PySide6.QtCore import QPoint, QPointF, QProcess, QRect, Qt, QThreadPool
+    from PySide6.QtGui import QImage, QPainter, QPixmap, QWheelEvent
+    from PySide6.QtTest import QTest
     from PySide6.QtWidgets import QApplication, QStyleOptionViewItem
 except (ImportError, OSError):
     pytest.skip("Qt libraries are unavailable", allow_module_level=True)
@@ -18,6 +19,7 @@ from imagelib.services.catalog import FaceDetail, FaceMatchProposal, ImageListIt
 from imagelib.ui.main_window import (
     AnalysisCoordinator,
     CalendarView,
+    ChronologicalView,
     DetailPanel,
     FaceImageWidget,
     FaceMatchReviewDialog,
@@ -277,6 +279,226 @@ def test_main_window_analysis_uses_calendar_selection(application):
     window._analyse_selected()
 
     assert calls == [(window._root, [7])]
+    window.close()
+
+
+def test_main_window_analysis_uses_browser_selection(application):
+    window = MainWindow()
+    window._root_generation = 1
+    window.browser.model.set_items([image_item(9, "nine.jpg")])
+    window._load_detail = lambda _image_id: None
+    window.resize(1100, 800)
+    window.show()
+    application.processEvents()
+    rectangle = window.browser.view.visualRect(window.browser.model.index(0))
+    QTest.mouseClick(
+        window.browser.view.viewport(),
+        Qt.MouseButton.LeftButton,
+        pos=rectangle.center(),
+    )
+    calls = []
+    window.analysis.start = lambda root, image_ids=None: calls.append((root, image_ids))
+
+    window._analyse_selected()
+
+    assert calls == [(window._root, [9])]
+    window.close()
+
+
+def test_chronological_groups_are_oldest_first_and_preserve_day_order(application):
+    model = CalendarModel()
+    model.set_groups(
+        {
+            date(2025, 2, 1): [image_item(4, "four.jpg")],
+            date(2024, 12, 31): [image_item(2, "two.jpg"), image_item(1, "one.jpg")],
+            None: [image_item(5, "unknown.jpg")],
+            date(2025, 1, 2): [image_item(3, "three.jpg")],
+        }
+    )
+    timeline = ChronologicalView(model)
+
+    assert [group.day for group in timeline.day_groups] == [
+        date(2024, 12, 31),
+        date(2025, 1, 2),
+        date(2025, 2, 1),
+        None,
+    ]
+    assert [item.id for item in timeline.day_groups[0].items] == [2, 1]
+    assert timeline.day_groups[-1].marker_text == ""
+    assert not timeline.day_groups[-1].month_marker
+    assert not timeline.day_groups[-1].year_marker
+    timeline.deleteLater()
+
+
+def test_chronological_month_and_year_markers_include_combined_boundary_label(application):
+    model = CalendarModel()
+    model.set_groups(
+        {
+            date(2025, 2, 9): [image_item(5, "february.jpg")],
+            date(2024, 12, 31): [image_item(1, "december.jpg")],
+            date(2025, 1, 3): [image_item(2, "january.jpg")],
+            date(2025, 1, 8): [image_item(3, "same-month.jpg")],
+            None: [image_item(6, "unknown.jpg")],
+            date(2025, 2, 1): [image_item(4, "month-start.jpg")],
+        }
+    )
+    timeline = ChronologicalView(model)
+    groups = {group.day: group for group in timeline.day_groups}
+
+    assert groups[date(2024, 12, 31)].month_marker
+    assert groups[date(2024, 12, 31)].year_marker
+    assert groups[date(2024, 12, 31)].marker_text == "December 2024"
+    assert groups[date(2025, 1, 3)].month_marker
+    assert groups[date(2025, 1, 3)].year_marker
+    assert groups[date(2025, 1, 3)].marker_text == "January 2025"
+    assert not groups[date(2025, 1, 8)].month_marker
+    assert not groups[date(2025, 1, 8)].year_marker
+    assert groups[date(2025, 2, 1)].month_marker
+    assert not groups[date(2025, 2, 1)].year_marker
+    assert groups[date(2025, 2, 1)].marker_text == "February"
+    assert groups[None].marker_text == ""
+    timeline.deleteLater()
+
+
+def test_chronological_rows_wrap_after_resize_and_scroll_vertically(application):
+    model = CalendarModel()
+    busy_day = date(2026, 5, 20)
+    model.set_groups(
+        {
+            busy_day: [image_item(index, f"{index}.jpg") for index in range(1, 37)],
+            date(2026, 5, 21): [image_item(37, "next-day.jpg")],
+        }
+    )
+    timeline = ChronologicalView(model)
+    timeline.resize(720, 280)
+    timeline.show()
+    application.processEvents()
+    wide_row = timeline.canvas.row_for_date(busy_day)
+    assert wide_row is not None
+    wide_columns = wide_row.columns
+
+    timeline.resize(250, 180)
+    application.processEvents()
+    narrow_row = timeline.canvas.row_for_date(busy_day)
+    assert narrow_row is not None
+    assert narrow_row.columns < wide_columns
+    assert narrow_row.image_rows > wide_row.image_rows
+    assert timeline.scroll_area.verticalScrollBar().maximum() > 0
+
+    scrollbar = timeline.scroll_area.verticalScrollBar()
+    before = scrollbar.value()
+    point = QPoint(24, 24)
+    wheel = QWheelEvent(
+        QPointF(point),
+        QPointF(timeline.canvas.mapToGlobal(point)),
+        QPoint(0, 0),
+        QPoint(0, -120),
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+        Qt.ScrollPhase.ScrollUpdate,
+        False,
+    )
+    QApplication.sendEvent(timeline.canvas, wheel)
+    application.processEvents()
+    assert scrollbar.value() > before
+    timeline.close()
+
+
+def test_chronological_clicks_select_multiple_images_and_pixmaps_update(application):
+    model = CalendarModel()
+    day = date(2026, 7, 4)
+    model.set_groups({day: [image_item(1, "one.jpg"), image_item(2, "two.jpg")]})
+    timeline = ChronologicalView(model)
+    timeline.resize(520, 260)
+    timeline.show()
+    application.processEvents()
+    clicked = []
+    timeline.image_clicked.connect(clicked.append)
+    first_rect = timeline.canvas.item_rect(1)
+    second_rect = timeline.canvas.item_rect(2)
+    QTest.mouseMove(timeline.canvas, first_rect.center())
+    application.processEvents()
+    assert "one.jpg" in timeline.canvas.toolTip()
+    assert timeline.canvas.accessibleName() == "Chronological image timeline"
+
+    QTest.mouseClick(timeline.canvas, Qt.MouseButton.LeftButton, pos=second_rect.center())
+    QTest.mouseClick(
+        timeline.canvas,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.ControlModifier,
+        first_rect.center(),
+    )
+
+    assert [item.id for item in clicked] == [2, 1]
+    assert timeline.selected_image_ids() == [1, 2]
+    pixmap = QPixmap(20, 20)
+    pixmap.fill("#d21f3c")
+    model.set_pixmap(1, pixmap)
+    image = QImage(timeline.canvas.size(), QImage.Format.Format_ARGB32)
+    image.fill("#ffffff")
+    painter = QPainter(image)
+    timeline.canvas.render(painter, QPoint(0, 0))
+    painter.end()
+    item_rect = timeline.canvas.item_rect(1)
+    image_rect = item_rect.adjusted(5, 4, -5, -23)
+    assert image.pixelColor(image_rect.center()) == pixmap.toImage().pixelColor(0, 0)
+
+    model.set_groups(
+        {
+            day: [image_item(1, "one.jpg"), image_item(2, "two.jpg"), image_item(3, "three.jpg")]
+        }
+    )
+    assert timeline.selected_image_ids() == [1, 2]
+    model.set_groups({day: [image_item(1, "one.jpg"), image_item(3, "three.jpg")]})
+    assert timeline.selected_image_ids() == [1]
+    timeline.close()
+
+
+def test_chronological_click_opens_detail_and_analyse_selected_uses_timeline_ids(application):
+    window = MainWindow()
+    window._root_generation = 1
+    day = date(2026, 8, 12)
+    window.calendar_model.set_groups(
+        {day: [image_item(8, "eight.jpg"), image_item(7, "seven.jpg")]}
+    )
+    window.resize(1100, 800)
+    window.show()
+    application.processEvents()
+    opened = []
+    window._load_detail = opened.append
+    first = window.chronological.canvas.item_rect(8)
+    second = window.chronological.canvas.item_rect(7)
+    QTest.mouseClick(window.chronological.canvas, Qt.MouseButton.LeftButton, pos=first.center())
+    QTest.mouseClick(
+        window.chronological.canvas,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.ControlModifier,
+        second.center(),
+    )
+    assert opened == [8, 7]
+    assert window._selected_image_id == 7
+
+    calls = []
+    window.analysis.start = lambda root, image_ids=None: calls.append((root, image_ids))
+    window.chronological_button.click()
+    assert window.calendar_stack.currentWidget() is window.chronological
+    window._analyse_selected()
+
+    assert calls == [(window._root, [8, 7])]
+    window.close()
+
+
+def test_view_radio_buttons_ignore_toggled_off_signals(application):
+    window = MainWindow()
+
+    window.calendar_button.click()
+    assert window.calendar_stack.currentWidget() is window.calendar
+    window.chronological_button.click()
+    assert window.calendar_stack.currentWidget() is window.chronological
+    window.browser_button.click()
+    assert window.calendar_stack.currentWidget() is window.browser
+    window._switch_view(2, False)
+    assert window.calendar_stack.currentWidget() is window.browser
     window.close()
 
 
