@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from threading import Lock
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any
 
 from sklearn.cluster import DBSCAN
 from sqlalchemy import delete, select, update
@@ -28,7 +29,7 @@ class AnalysisReport:
     analysed: int = 0
     faces: int = 0
     errors: int = 0
-    results: tuple["WorkerAnalysisResult", ...] = ()
+    results: tuple[WorkerAnalysisResult, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -168,11 +169,9 @@ def _select_analysis_targets(
             continue
         if explicit and image.id not in requested_ids and str(Path(image.path).resolve()) not in requested_paths:
             continue
-        if force:
+        if force or image.status == "indexed":  # noqa: SIM114
             result.append(image)
-        elif image.status == "indexed":
-            result.append(image)
-        elif explicit and include_errors and image.status == "error":
+        elif explicit and include_errors and image.status == "error":  # noqa: SIM114
             result.append(image)
         elif explicit and image.status == "error" and (
             image.id in requested_ids or str(Path(image.path).resolve()) in requested_paths
@@ -319,7 +318,7 @@ def persist_worker_response(
                     raise TypeError("Worker faces must be a sequence of dictionaries")
                 values = [_face_values(item) for item in raw_faces]
                 error_text = None
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 values = None
                 error_text = _worker_error_text(exc)
 
@@ -981,7 +980,7 @@ def analyse_images(
         try:
             if targets:
                 model = _get_model()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             model_error = exc
         for image in targets:
             if progress:
@@ -1019,7 +1018,7 @@ def analyse_images(
                         face_count=image.face_count,
                     )
                 )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 _mark_error(session, image, exc)
                 report.errors += 1
                 results.append(
