@@ -14,6 +14,10 @@ FOCUS_STYLE = """
 QLineEdit:focus, QPushButton:focus, QToolButton:focus, QComboBox:focus, QSpinBox:focus {
     border: 1px solid palette(highlight);
 }
+QToolButton#personCard:checked {
+    border: 2px solid palette(highlight);
+    background: palette(alternate-base);
+}
 QSplitter::handle {
     background: palette(mid);
 }
