@@ -386,6 +386,216 @@ class RecordingPool:
         self.tasks.clear()
 
 
+def person_group(person_id: int, name: str | None = None, image_path: str = ""):
+    return catalog.PersonGroup(
+        person_id=person_id,
+        name=name,
+        face_count=3,
+        image_count=2,
+        representative_face_id=person_id + 100,
+        representative_face_x=2,
+        representative_face_y=3,
+        representative_face_w=8,
+        representative_face_h=9,
+        representative_image_id=person_id + 200,
+        representative_image_path=image_path,
+        representative_thumbnail_path=None,
+    )
+
+
+def test_people_gallery_cards_are_checkable_accessible_and_apply_any_or_all(application):
+    from imagelib.ui.main_window import PeopleView
+
+    view = PeopleView()
+    view.begin_edit((), "any")
+    view.set_groups([person_group(4, "Ada"), person_group(5)])
+    actions = []
+    view.apply_requested.connect(lambda ids, mode: actions.append((ids, mode)))
+
+    assert not view.apply_button.isEnabled()
+    assert view.cards[4].text().startswith("Ada\n3 faces · 2 images")
+    assert view.cards[5].text().startswith("Unlabelled group 5")
+    assert view.cards[4].isCheckable()
+    assert "Not selected" in view.cards[4].accessibleDescription()
+
+    view.cards[4].click()
+    view.cards[5].click()
+    view.all_button.click()
+    assert view.apply_button.isEnabled()
+    assert "Selected" in view.cards[4].accessibleDescription()
+    view.apply_button.click()
+
+    assert actions == [([4, 5], "all")]
+    view.deleteLater()
+
+
+@pytest.mark.parametrize("previous_view", ["browser", "calendar"])
+def test_people_picker_apply_and_cancel_preserve_active_filter_and_return_view(
+    application, monkeypatch, previous_view
+):
+    window = MainWindow()
+    pool = RecordingPool()
+    window.pool = pool
+    if previous_view == "browser":
+        window.browser.set_directory(Path("holiday"))
+    else:
+        window.calendar_button.setChecked(True)
+    window._people_filter_ids = (4,)
+    window._people_filter_mode = "all"
+    groups = [person_group(4, "Ada"), person_group(5, "Grace")]
+    monkeypatch.setattr(catalog, "list_person_groups", lambda **_kwargs: groups)
+
+    window._open_people_picker()
+    assert window.calendar_stack.currentWidget() is window.people_view
+    pool.tasks.pop(0).run()
+    window.people_view.cards[5].click()
+    window.people_view.any_button.click()
+    window._cancel_people_picker()
+
+    assert window._people_filter_ids == (4,)
+    assert window._people_filter_mode == "all"
+    assert window.calendar_stack.currentWidget() is (
+        window.browser if previous_view == "browser" else window.calendar
+    )
+    if previous_view == "browser":
+        assert window.browser.directory == Path("holiday")
+
+    pool.tasks.clear()
+    window._open_people_picker()
+    pool.tasks.pop(0).run()
+    assert window.people_view.cards[4].isChecked()
+    assert not window.people_view.cards[5].isChecked()
+    assert window.people_view.all_button.isChecked()
+    window.people_view.cards[5].click()
+    window.people_view.apply_button.click()
+
+    assert window._people_filter_ids == (4, 5)
+    assert window._people_filter_mode == "all"
+    assert window.calendar_stack.currentWidget() is (
+        window.browser if previous_view == "browser" else window.calendar
+    )
+    if previous_view == "browser":
+        assert window.browser.directory == Path("holiday")
+    assert window._selected_image_id is None
+    assert not window.people_filter_label.isHidden()
+    window.close()
+
+
+@pytest.mark.parametrize("person_match", ["any", "all"])
+def test_people_filter_is_passed_to_refresh_and_folder_navigation(
+    application, monkeypatch, person_match
+):
+    window = MainWindow()
+    pool = RecordingPool()
+    window.pool = pool
+    window._people_filter_ids = (12, 15)
+    window._people_filter_mode = person_match
+    window.browser.set_directory(Path("events"))
+    browser_calls = []
+    calendar_calls = []
+    monkeypatch.setattr(catalog, "status_counts", lambda **_kwargs: {"pending": 0, "indexed": 1, "analysed": 2, "error": 0})
+
+    def browser_images(**kwargs):
+        browser_calls.append(kwargs)
+        return []
+
+    def calendar_groups(**kwargs):
+        calendar_calls.append(kwargs)
+        return {}
+
+    monkeypatch.setattr(catalog, "browser_images", browser_images)
+    monkeypatch.setattr(catalog, "calendar_groups", calendar_groups)
+
+    window._refresh(window._root_generation)
+    pool.tasks.pop(0).run()
+
+    assert [call.get("directory") for call in browser_calls] == [Path("events"), None]
+    assert all(
+        call["persons"] == (12, 15) and call["person_match"] == person_match
+        for call in browser_calls
+    )
+    assert calendar_calls == [
+        {"root": window._root, "persons": (12, 15), "person_match": person_match}
+    ]
+
+    window._browse_directory(Path("events/2026"))
+    pool.tasks.pop().run()
+    assert browser_calls[-1]["directory"] == Path("events/2026")
+    assert browser_calls[-1]["persons"] == (12, 15)
+    assert browser_calls[-1]["person_match"] == person_match
+    assert window.total_label.text() == "Total 3"
+    window.close()
+
+
+def test_clearing_people_filter_restores_unfiltered_queries(application, monkeypatch):
+    window = MainWindow()
+    pool = RecordingPool()
+    window.pool = pool
+    window._people_filter_ids = (12,)
+    window._people_filter_mode = "all"
+    calls = []
+    monkeypatch.setattr(catalog, "status_counts", lambda **_kwargs: {})
+    monkeypatch.setattr(catalog, "browser_images", lambda **kwargs: calls.append(kwargs) or [])
+    monkeypatch.setattr(catalog, "calendar_groups", lambda **_kwargs: {})
+
+    window._clear_people_filter()
+    pool.tasks.pop(0).run()
+
+    assert window._people_filter_ids == ()
+    assert window._people_filter_mode == "any"
+    assert all(call["persons"] is None and call["person_match"] == "any" for call in calls)
+    assert window.people_filter_label.isHidden()
+    window.close()
+
+
+def test_people_root_change_resets_filter_and_ignores_stale_group_result(
+    application, monkeypatch, tmp_path
+):
+    window = MainWindow()
+    pool = RecordingPool()
+    window.pool = pool
+    window._people_filter_ids = (4,)
+    window._people_filter_mode = "all"
+    monkeypatch.setattr(catalog, "list_person_groups", lambda **_kwargs: [person_group(99)])
+    window._open_people_picker()
+    stale_groups_task = pool.tasks.pop(0)
+    old_generation = window._root_generation
+    window._people_groups_ready(window._people_query_serial, old_generation, [person_group(99)])
+    stale_crop_task = pool.tasks.pop(0)
+
+    window._root_validated(window._validation_serial, (tmp_path, True))
+    stale_groups_task.run()
+    stale_crop_task.run()
+
+    assert window._root_generation == old_generation + 1
+    assert window._people_filter_ids == ()
+    assert window._people_filter_mode == "any"
+    assert window.calendar_stack.currentWidget() is window.browser
+    assert window.people_view.cards == {}
+    window.close()
+
+
+def test_people_representative_face_crop_is_loaded_in_worker(application, tmp_path):
+    from PIL import Image as PillowImage
+
+    path = tmp_path / "representative.png"
+    PillowImage.new("RGB", (24, 24), "red").save(path)
+    window = MainWindow()
+    pool = RecordingPool()
+    window.pool = pool
+    window._root_generation = 1
+    group = person_group(4, "Ada", str(path))
+    window._people_query_serial = 2
+    window.people_view.set_groups([group])
+
+    window._people_groups_ready(2, 1, [group])
+    crop_task = pool.tasks.pop(0)
+    crop_task.run()
+
+    assert not window.people_view.cards[4].icon().isNull()
+    window.close()
+
+
 def test_face_group_label_service_runs_in_worker_and_refreshes_name(
     application, monkeypatch
 ):

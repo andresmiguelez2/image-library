@@ -35,6 +35,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -1115,6 +1116,195 @@ class BrowserView(QWidget):
         return self.view.selected_image_ids()
 
 
+class PeopleView(QWidget):
+    apply_requested = Signal(object, str)
+    back_requested = Signal()
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._groups: dict[int, catalog.PersonGroup] = {}
+        self.cards: dict[int, QToolButton] = {}
+        self._draft_ids: set[int] = set()
+        self._draft_mode = "any"
+
+        heading = QLabel("Choose people")
+        heading.setObjectName("peopleHeading")
+        font = heading.font()
+        font.setBold(True)
+        heading.setFont(font)
+        description = QLabel("Select one or more groups, then choose how they should match.")
+        description.setWordWrap(True)
+
+        self.any_button = QRadioButton("Any selected person")
+        self.any_button.setAccessibleName("Match any selected person")
+        self.all_button = QRadioButton("All selected people")
+        self.all_button.setAccessibleName("Match all selected people")
+        self.mode_group = QButtonGroup(self)
+        self.mode_group.setExclusive(True)
+        self.mode_group.addButton(self.any_button)
+        self.mode_group.addButton(self.all_button)
+        self.any_button.setChecked(True)
+        self.any_button.toggled.connect(self._mode_changed)
+        self.all_button.toggled.connect(self._mode_changed)
+
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(self.any_button)
+        mode_row.addWidget(self.all_button)
+        mode_row.addStretch(1)
+
+        self.message = QLabel("People groups will appear here.")
+        self.message.setWordWrap(True)
+        self.message.setAccessibleName("People gallery status")
+        self.gallery = QWidget()
+        self.gallery_layout = QGridLayout(self.gallery)
+        self.gallery_layout.setContentsMargins(0, 0, 0, 0)
+        self.gallery_layout.setSpacing(12)
+        self.gallery_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll.setWidget(self.gallery)
+        self.scroll.viewport().installEventFilter(self)
+
+        self.apply_button = QPushButton("Apply")
+        self.apply_button.setAccessibleName("Apply people filter")
+        self.apply_button.setEnabled(False)
+        self.back_button = QPushButton("Cancel / Back")
+        self.back_button.setAccessibleName("Cancel people selection and return")
+        self.apply_button.clicked.connect(self._apply)
+        self.back_button.clicked.connect(lambda: self.back_requested.emit())
+
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        actions.addWidget(self.back_button)
+        actions.addWidget(self.apply_button)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(heading)
+        layout.addWidget(description)
+        layout.addLayout(mode_row)
+        layout.addWidget(self.message)
+        layout.addWidget(self.scroll, 1)
+        layout.addLayout(actions)
+
+    def eventFilter(self, watched, event) -> bool:
+        if watched is self.scroll.viewport() and event.type() == QEvent.Type.Resize:
+            self._layout_cards()
+        return super().eventFilter(watched, event)
+
+    def begin_edit(self, selected_ids, mode: str) -> None:
+        self._draft_ids = set(selected_ids)
+        self._draft_mode = mode if mode in {"any", "all"} else "any"
+        self.any_button.setChecked(self._draft_mode == "any")
+        self.all_button.setChecked(self._draft_mode == "all")
+        self._update_selection_state()
+
+    def set_loading(self) -> None:
+        self._clear_cards()
+        self.apply_button.setEnabled(False)
+        self.message.setText("Loading people groups…")
+        self.message.setVisible(True)
+
+    def set_groups(self, groups) -> None:
+        groups = list(groups)
+        self._clear_cards()
+        self._groups = {group.person_id: group for group in groups}
+        self._draft_ids.intersection_update(self._groups)
+        for group in groups:
+            label = group.name or f"Unlabelled group {group.person_id}"
+            faces = f"{group.face_count} face" + ("s" if group.face_count != 1 else "")
+            images = f"{group.image_count} image" + ("s" if group.image_count != 1 else "")
+            card = QToolButton(self.gallery)
+            card.setObjectName("personCard")
+            card.setCheckable(True)
+            card.setAutoRaise(False)
+            card.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
+            card.setIconSize(QSize(128, 128))
+            card.setMinimumSize(168, 210)
+            card.setMaximumWidth(220)
+            card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+            card.setText(f"{label}\n{faces} · {images}")
+            card.setAccessibleName(label)
+            card.setAccessibleDescription(f"{faces}, {images}. Not selected.")
+            card.setToolTip(f"{label}\n{faces} · {images}")
+            card.toggled.connect(lambda checked, person_id=group.person_id: self._card_toggled(person_id, checked))
+            card.setChecked(group.person_id in self._draft_ids)
+            self.cards[group.person_id] = card
+        self.message.setText("No grouped people are available for this library." if not groups else "")
+        self.message.setVisible(not groups)
+        self._layout_cards()
+        self._update_selection_state()
+
+    def set_crop(self, person_id: int, pixmap: QPixmap) -> None:
+        card = self.cards.get(person_id)
+        if card is not None and not pixmap.isNull():
+            card.setIcon(QIcon(pixmap))
+
+    def set_error(self, message: str) -> None:
+        self._clear_cards()
+        self._draft_ids.clear()
+        self.message.setText(f"Could not load people groups: {message}")
+        self.message.setVisible(True)
+        self._update_selection_state()
+
+    def reset(self) -> None:
+        self._draft_ids.clear()
+        self._draft_mode = "any"
+        self._clear_cards()
+        self.any_button.setChecked(True)
+        self.message.setText("People groups will appear here.")
+        self.message.setVisible(True)
+        self._update_selection_state()
+
+    def _clear_cards(self) -> None:
+        self._groups.clear()
+        self.cards.clear()
+        while self.gallery_layout.count():
+            child = self.gallery_layout.takeAt(0)
+            if child.widget() is not None:
+                child.widget().deleteLater()
+
+    def _layout_cards(self) -> None:
+        if not self.cards:
+            return
+        columns = max(1, self.scroll.viewport().width() // 190)
+        for column in range(self.gallery_layout.columnCount()):
+            self.gallery_layout.setColumnStretch(column, 0)
+        while self.gallery_layout.count():
+            self.gallery_layout.takeAt(0)
+        for index, card in enumerate(self.cards.values()):
+            self.gallery_layout.addWidget(card, index // columns, index % columns)
+        for column in range(columns):
+            self.gallery_layout.setColumnStretch(column, 1)
+
+    def _card_toggled(self, person_id: int, checked: bool) -> None:
+        if checked:
+            self._draft_ids.add(person_id)
+        else:
+            self._draft_ids.discard(person_id)
+        self._update_selection_state()
+
+    def _mode_changed(self, checked: bool) -> None:
+        if checked:
+            self._draft_mode = "all" if self.all_button.isChecked() else "any"
+
+    def _update_selection_state(self) -> None:
+        for person_id, card in self.cards.items():
+            selected = person_id in self._draft_ids
+            card.setAccessibleDescription(
+                f"{self._groups[person_id].face_count} faces, "
+                f"{self._groups[person_id].image_count} images. "
+                f"{'Selected' if selected else 'Not selected'}."
+            )
+        self.apply_button.setEnabled(bool(self._draft_ids))
+
+    def _apply(self) -> None:
+        if self._draft_ids:
+            ordered_ids = [person_id for person_id in self._groups if person_id in self._draft_ids]
+            ordered_ids.extend(sorted(self._draft_ids.difference(ordered_ids)))
+            self.apply_requested.emit(ordered_ids, self._draft_mode)
+
+
 class AnalysisCoordinator(QObject):
     status = Signal(str)
     progress = Signal(int, int)
@@ -1399,6 +1589,11 @@ class MainWindow(QMainWindow):
         self._validation_serial = 0
         self._detail_serial = 0
         self._browser_serial = 0
+        self._catalog_serial = 0
+        self._people_query_serial = 0
+        self._people_filter_ids: tuple[int, ...] = ()
+        self._people_filter_mode = "any"
+        self._people_return_widget: QWidget | None = None
         self._splitters_sized = False
         self._selected_image_id: int | None = None
         self._face_label_active = False
@@ -1443,6 +1638,9 @@ class MainWindow(QMainWindow):
         view_layout.addWidget(self.browser_button)
         view_layout.addWidget(self.calendar_button)
         view_switch.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
+        self.people_button = QPushButton("People")
+        self.people_button.setAccessibleName("Open people search")
+        self.people_button.clicked.connect(self._open_people_picker)
         self.visualise = QCheckBox("Show face rectangles on detail")
         self.visualise.toggled.connect(self._visualisation_changed)
         self.analyse_selected_button = QPushButton("Analyse selected")
@@ -1459,6 +1657,7 @@ class MainWindow(QMainWindow):
         toolbar.setFloatable(False)
         toolbar.setContextMenuPolicy(Qt.ContextMenuPolicy.PreventContextMenu)
         toolbar.addWidget(view_switch)
+        toolbar.addWidget(self.people_button)
         toolbar.addSeparator()
         toolbar.addWidget(self.analyse_selected_button)
         toolbar.addWidget(self.analyse_all_button)
@@ -1480,6 +1679,20 @@ class MainWindow(QMainWindow):
         sidebar_layout.addWidget(self.analysed_label)
         sidebar_layout.addWidget(self.not_analysed_label)
         sidebar_layout.addWidget(self.errors_label)
+        self.people_filter_label = QLabel()
+        self.people_filter_label.setObjectName("peopleFilterIndicator")
+        self.people_filter_label.setWordWrap(True)
+        self.people_filter_label.setAccessibleName("Active people filter")
+        self.edit_people_filter_button = QPushButton("Edit people filter…")
+        self.edit_people_filter_button.clicked.connect(self._open_people_picker)
+        self.clear_people_filter_button = QPushButton("Clear people filter")
+        self.clear_people_filter_button.clicked.connect(self._clear_people_filter)
+        self.people_filter_label.setVisible(False)
+        self.edit_people_filter_button.setVisible(False)
+        self.clear_people_filter_button.setVisible(False)
+        sidebar_layout.addWidget(self.people_filter_label)
+        sidebar_layout.addWidget(self.edit_people_filter_button)
+        sidebar_layout.addWidget(self.clear_people_filter_button)
         sidebar_layout.addSpacing(8)
         sidebar_layout.addWidget(self.visualise)
         sidebar_layout.addStretch(1)
@@ -1493,6 +1706,10 @@ class MainWindow(QMainWindow):
         self.calendar_stack = QStackedWidget()
         self.calendar_stack.addWidget(self.browser)
         self.calendar_stack.addWidget(self.calendar)
+        self.people_view = PeopleView(self)
+        self.people_view.apply_requested.connect(self._apply_people_filter)
+        self.people_view.back_requested.connect(self._cancel_people_picker)
+        self.calendar_stack.addWidget(self.people_view)
         self.calendar_stack.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         _use_surface(self.calendar_stack, QPalette.ColorRole.Base)
         self.detail = DetailPanel(self.pool, self)
@@ -1563,6 +1780,10 @@ class MainWindow(QMainWindow):
         self.active_root_label.setText(f"Active root: {root}")
         self._root_generation += 1
         generation = self._root_generation
+        self._people_query_serial += 1
+        self._people_filter_ids = ()
+        self._people_filter_mode = "any"
+        self.people_view.reset()
         self._selected_image_id = None
         self._detail_serial += 1
         self._face_label_active = False
@@ -1580,6 +1801,9 @@ class MainWindow(QMainWindow):
         self.detail.clear()
         self._browser_serial += 1
         self.browser.set_root(root)
+        self._update_people_filter_indicator()
+        if self.calendar_stack.currentWidget() is self.people_view:
+            self._restore_photo_view()
         self.calendar_model.set_groups({})
         self._set_status(f"Scanning {root}…")
         self._check_pending_proposals()
@@ -1616,31 +1840,174 @@ class MainWindow(QMainWindow):
             logger.error("Scan callback failed for %s: %s", self._root, message)
             self._set_status(f"Scan failed: {message}")
 
+    def _open_people_picker(self) -> None:
+        if self.calendar_stack.currentWidget() is not self.people_view:
+            self._people_return_widget = self.calendar_stack.currentWidget()
+        self.browser_button.setEnabled(False)
+        self.calendar_button.setEnabled(False)
+        self.people_view.begin_edit(self._people_filter_ids, self._people_filter_mode)
+        self.people_view.set_loading()
+        self.calendar_stack.setCurrentWidget(self.people_view)
+        self._people_query_serial += 1
+        serial = self._people_query_serial
+        generation = self._root_generation
+        root = self._root
+        task = FunctionTask(lambda: catalog.list_person_groups(root=root), self)
+        task.signals.result.connect(
+            lambda groups, s=serial, g=generation: self._people_groups_ready(s, g, groups)
+        )
+        task.signals.error.connect(
+            lambda message, s=serial, g=generation: self._people_groups_error(s, g, message)
+        )
+        self.pool.start(task)
+
+    def _people_groups_ready(self, serial: int, generation: int, groups) -> None:
+        if serial != self._people_query_serial or generation != self._root_generation:
+            return
+        groups = list(groups)
+        self.people_view.set_groups(groups)
+        for group in groups:
+            task = ImageAssetTask(
+                group.representative_image_path,
+                (
+                    FaceBounds(
+                        group.representative_face_x,
+                        group.representative_face_y,
+                        group.representative_face_w,
+                        group.representative_face_h,
+                    ),
+                ),
+                group.representative_thumbnail_path,
+                self,
+            )
+            task.signals.result.connect(
+                lambda asset, s=serial, g=generation, p=group.person_id: self._person_crop_ready(
+                    s, g, p, asset
+                )
+            )
+            task.signals.error.connect(
+                lambda _message, s=serial, g=generation, p=group.person_id: self._person_crop_failed(
+                    s, g, p
+                )
+            )
+            self.pool.start(task)
+
+    def _people_groups_error(self, serial: int, generation: int, message: str) -> None:
+        if serial == self._people_query_serial and generation == self._root_generation:
+            logger.error("Could not load people groups for %s: %s", self._root, message)
+            self.people_view.set_error(message)
+
+    def _person_crop_ready(
+        self, serial: int, generation: int, person_id: int, asset: ImageAsset
+    ) -> None:
+        if serial != self._people_query_serial or generation != self._root_generation:
+            return
+        image = asset.crops[0] if asset.crops and not asset.crops[0].isNull() else asset.image
+        if not image.isNull():
+            self.people_view.set_crop(person_id, QPixmap.fromImage(image))
+
+    def _person_crop_failed(self, serial: int, generation: int, person_id: int) -> None:
+        if serial == self._people_query_serial and generation == self._root_generation:
+            card = self.people_view.cards.get(person_id)
+            if card is not None:
+                card.setToolTip(f"{card.toolTip()}\nRepresentative face unavailable")
+
+    def _apply_people_filter(self, person_ids, mode: str) -> None:
+        selected = tuple(dict.fromkeys(int(person_id) for person_id in person_ids))
+        if not selected:
+            return
+        self._people_filter_ids = selected
+        self._people_filter_mode = mode if mode in {"any", "all"} else "any"
+        self._people_query_serial += 1
+        self._restore_photo_view()
+        self._update_people_filter_indicator()
+        self._clear_selected_detail()
+        self._browser_serial += 1
+        self._refresh(self._root_generation)
+
+    def _cancel_people_picker(self) -> None:
+        self._people_query_serial += 1
+        self._restore_photo_view()
+
+    def _restore_photo_view(self) -> None:
+        target = self._people_return_widget
+        if target not in (self.browser, self.calendar):
+            target = self.browser
+        self.calendar_stack.setCurrentWidget(target)
+        self.browser_button.blockSignals(True)
+        self.calendar_button.blockSignals(True)
+        self.browser_button.setChecked(target is self.browser)
+        self.calendar_button.setChecked(target is self.calendar)
+        self.browser_button.blockSignals(False)
+        self.calendar_button.blockSignals(False)
+        self.browser_button.setEnabled(True)
+        self.calendar_button.setEnabled(True)
+
+    def _update_people_filter_indicator(self) -> None:
+        active = bool(self._people_filter_ids)
+        if active:
+            match = "Any" if self._people_filter_mode == "any" else "All"
+            message = f"People filter: {len(self._people_filter_ids)} selected · {match} match"
+            self.people_filter_label.setText(message)
+            self.people_filter_label.setToolTip(message)
+        self.people_filter_label.setVisible(active)
+        self.edit_people_filter_button.setVisible(active)
+        self.clear_people_filter_button.setVisible(active)
+
+    def _clear_selected_detail(self) -> None:
+        self._selected_image_id = None
+        self._detail_serial += 1
+        self.detail.clear()
+
+    def _clear_people_filter(self) -> None:
+        self._people_filter_ids = ()
+        self._people_filter_mode = "any"
+        self._people_query_serial += 1
+        if self.calendar_stack.currentWidget() is self.people_view:
+            self._restore_photo_view()
+        self._update_people_filter_indicator()
+        self._clear_selected_detail()
+        self._browser_serial += 1
+        self._refresh(self._root_generation)
+
     def _refresh(self, generation: int) -> None:
         root = self._root
         directory = self.browser.directory
         browser_serial = self._browser_serial
+        self._catalog_serial += 1
+        catalog_serial = self._catalog_serial
+        persons = self._people_filter_ids
+        person_match = self._people_filter_mode
         task = FunctionTask(
             lambda: (
                 catalog.status_counts(root=root),
-                catalog.browser_images(root=root, directory=directory),
-                catalog.calendar_groups(root=root),
-                catalog.browser_images(root=root),
+                catalog.browser_images(
+                    root=root, directory=directory, persons=persons or None, person_match=person_match
+                ),
+                catalog.calendar_groups(root=root, persons=persons or None, person_match=person_match),
+                catalog.browser_images(root=root, persons=persons or None, person_match=person_match),
             ),
             self,
         )
         task.signals.result.connect(
-            lambda snapshot, g=generation, d=directory, b=browser_serial: self._catalog_ready(
-                g, snapshot, d, b
+            lambda snapshot, g=generation, d=directory, b=browser_serial, c=catalog_serial: self._catalog_ready(
+                g, snapshot, d, b, c
             )
         )
         task.signals.error.connect(
-            lambda message, g=generation, b=browser_serial: self._refresh_error(g, b, message)
+            lambda message, g=generation, b=browser_serial, c=catalog_serial: self._refresh_error(
+                g, b, message, c
+            )
         )
         self.pool.start(task)
 
-    def _catalog_ready(self, generation: int, snapshot, directory: Path, browser_serial: int) -> None:
-        if generation != self._root_generation:
+    def _catalog_ready(
+        self, generation: int, snapshot, directory: Path, browser_serial: int,
+        catalog_serial: int | None = None,
+    ) -> None:
+        if generation != self._root_generation or (
+            catalog_serial is not None and catalog_serial != self._catalog_serial
+        ):
             return
         counts, browser_items, groups, all_browser_items = snapshot
         total = sum(counts.values())
@@ -1656,6 +2023,12 @@ class MainWindow(QMainWindow):
         if browser_serial == self._browser_serial and directory == self.browser.directory:
             self._load_thumbnails(self.browser.model, browser_items, generation)
         self._load_thumbnails(self.calendar_model, self.calendar_model.items, generation)
+        if (
+            self._selected_image_id is not None
+            and self._people_filter_ids
+            and self._selected_image_id not in {item.id for item in all_browser_items}
+        ):
+            self._clear_selected_detail()
 
     def _catalog_error(self, generation: int, message: str) -> None:
         if generation != self._root_generation:
@@ -1665,9 +2038,14 @@ class MainWindow(QMainWindow):
         self.browser.model.set_items([])
         self.calendar_model.set_groups({})
 
-    def _refresh_error(self, generation: int, browser_serial: int, message: str) -> None:
+    def _refresh_error(
+        self, generation: int, browser_serial: int, message: str,
+        catalog_serial: int | None = None,
+    ) -> None:
         logger.error("Catalogue refresh callback failed for %s: %s", self._root, message)
-        if browser_serial == self._browser_serial:
+        if browser_serial == self._browser_serial and (
+            catalog_serial is None or catalog_serial == self._catalog_serial
+        ):
             self._catalog_error(generation, message)
 
     def _load_thumbnails(self, model, items, generation: int) -> None:
@@ -1692,7 +2070,14 @@ class MainWindow(QMainWindow):
         browser_serial = self._browser_serial
         generation = self._root_generation
         root = self._root
-        task = FunctionTask(lambda: catalog.browser_images(root=root, directory=directory), self)
+        persons = self._people_filter_ids
+        person_match = self._people_filter_mode
+        task = FunctionTask(
+            lambda: catalog.browser_images(
+                root=root, directory=directory, persons=persons or None, person_match=person_match
+            ),
+            self,
+        )
         task.signals.result.connect(
             lambda items, g=generation, b=browser_serial, d=directory: self._browser_ready(
                 g, b, d, items
