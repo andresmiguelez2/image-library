@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timezone
 from pathlib import Path
-from typing import Iterable, Literal
+from typing import Literal
 
 from sqlalchemy import select
 from sqlalchemy.orm import aliased
@@ -147,6 +148,18 @@ def _list_item(image: Image, root: Path) -> ImageListItem:
         face_count=image.face_count,
         status=image.status,
     )
+
+
+def _calendar_item_sort_key(item: ImageListItem) -> tuple[datetime, str, int]:
+    """Order by effective timestamp, treating naive datetimes as UTC."""
+    timestamp = item.taken_at or item.modified_at
+    if timestamp is None:
+        timestamp = datetime.max.replace(tzinfo=timezone.utc)
+    elif timestamp.utcoffset() is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    else:
+        timestamp = timestamp.astimezone(timezone.utc)
+    return timestamp, item.relative_path, item.id
 
 
 def _images_in_root(session, root: Path) -> list[Image]:

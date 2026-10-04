@@ -30,6 +30,7 @@ class ThumbnailModel(QAbstractListModel):
         super().__init__(parent)
         self.items: list[ImageListItem] = []
         self.pixmaps: dict[int, QPixmap] = {}
+        self._item_rows: dict[int, int] = {}
 
     def rowCount(self, parent=QModelIndex()) -> int:
         return 0 if parent.isValid() else len(self.items)
@@ -53,15 +54,16 @@ class ThumbnailModel(QAbstractListModel):
     def set_items(self, items: list[ImageListItem]) -> None:
         self.beginResetModel()
         self.items = list(items)
+        self._item_rows = {item.id: row for row, item in enumerate(self.items)}
         self.pixmaps = {}
         self.endResetModel()
 
     def set_pixmap(self, image_id: int, pixmap: QPixmap) -> None:
         self.pixmaps[image_id] = pixmap
-        for row, item in enumerate(self.items):
-            if item.id == image_id:
-                self.dataChanged.emit(self.index(row), self.index(row), [Qt.ItemDataRole.DecorationRole])
-                break
+        row = self._item_rows.get(image_id)
+        if row is None:
+            return
+        self.dataChanged.emit(self.index(row), self.index(row), [Qt.ItemDataRole.DecorationRole])
 
     def item(self, index: QModelIndex) -> ImageListItem | None:
         return index.data(Qt.ItemDataRole.UserRole) if index.isValid() else None
@@ -150,6 +152,7 @@ class CalendarModel(ThumbnailModel):
         for group_items in self.groups.values():
             items.extend(group_items)
         self.items = items
+        self._item_rows = {item.id: row for row, item in enumerate(self.items)}
         self.pixmaps = {}
         self.endResetModel()
 
