@@ -229,6 +229,132 @@ def test_catalog_browser_calendar_detail_and_counts(tmp_path):
     assert counts["analysed"] == 1 and counts["indexed"] == 1
 
 
+def test_catalog_person_groups_and_any_all_search_are_root_scoped(tmp_path):
+    factory = database()
+    root = tmp_path / "images"
+    outside = tmp_path / "outside"
+    (root / "a").mkdir(parents=True)
+    (root / "b").mkdir()
+    outside.mkdir()
+    paths = {
+        "combined": root / "a" / "combined.jpg",
+        "ada": root / "b" / "ada.jpg",
+        "unnamed": root / "unnamed.jpg",
+        "ungrouped": root / "unassigned.jpg",
+        "outside": outside / "outside.jpg",
+    }
+    dates = {
+        "combined": datetime(2026, 2, 1, 12),
+        "ada": datetime(2026, 2, 2, 12),
+        "unnamed": datetime(2026, 2, 3, 12),
+        "ungrouped": datetime(2026, 2, 4, 12),
+        "outside": datetime(2026, 2, 5, 12),
+    }
+    with factory() as session:
+        source = Source(path=str(root))
+        outside_source = Source(path=str(outside))
+        ada = Person(name="Ada")
+        unnamed = Person()
+        outside_only = Person(name="Outside only")
+        session.add_all([source, outside_source, ada, unnamed, outside_only])
+        session.flush()
+        images = {}
+        for label, path in paths.items():
+            images[label] = Image(
+                source_id=outside_source.id if label == "outside" else source.id,
+                path=str(path),
+                content_hash=label,
+                thumb_path=f"thumbs/{label}.jpg",
+                taken_at=dates[label],
+                face_count=2 if label == "combined" else 1,
+            )
+        session.add_all(images.values())
+        session.flush()
+        faces = [
+            Face(image_id=images["combined"].id, person_id=ada.id, x=1, y=2, w=3, h=4),
+            Face(image_id=images["combined"].id, person_id=unnamed.id, x=5, y=6, w=7, h=8),
+            Face(image_id=images["ada"].id, person_id=ada.id, x=9, y=10, w=11, h=12),
+            Face(image_id=images["unnamed"].id, person_id=unnamed.id, x=13, y=14, w=15, h=16),
+            Face(image_id=images["ungrouped"].id, person_id=None, x=17, y=18, w=19, h=20),
+            Face(image_id=images["outside"].id, person_id=ada.id, x=21, y=22, w=23, h=24),
+            Face(image_id=images["outside"].id, person_id=outside_only.id, x=25, y=26, w=27, h=28),
+        ]
+        session.add_all(faces)
+        session.flush()
+        ada.cover_face_id = faces[5].id
+        session.commit()
+        ada_id = ada.id
+        unnamed_id = unnamed.id
+
+    groups = catalog.list_person_groups(root=root, session_factory=factory)
+    by_id = {group.person_id: group for group in groups}
+    assert set(by_id) == {ada_id, unnamed_id}
+    ada_group = by_id[ada_id]
+    assert ada_group.name == "Ada"
+    assert ada_group.face_count == 2 and ada_group.image_count == 2
+    assert ada_group.representative_image_path == str(paths["combined"])
+    assert ada_group.representative_thumbnail_path == "thumbs/combined.jpg"
+    assert (
+        ada_group.representative_face_x,
+        ada_group.representative_face_y,
+        ada_group.representative_face_w,
+        ada_group.representative_face_h,
+    ) == (1, 2, 3, 4)
+    assert by_id[unnamed_id].name is None
+    assert by_id[unnamed_id].face_count == 2 and by_id[unnamed_id].image_count == 2
+
+    any_rows = catalog.list_images(
+        root=root, persons=[ada_id, unnamed_id], session_factory=factory
+    )
+    all_rows = catalog.list_images(
+        root=root,
+        persons=[ada_id, unnamed_id],
+        person_match="all",
+        session_factory=factory,
+    )
+    assert [Path(row.path).name for row in any_rows] == [
+        "combined.jpg",
+        "ada.jpg",
+        "unnamed.jpg",
+    ]
+    assert len({row.id for row in any_rows}) == len(any_rows)
+    assert [Path(row.path).name for row in all_rows] == ["combined.jpg"]
+    assert [
+        Path(row.path).name
+        for row in catalog.list_images(
+            root=root,
+            directory="a",
+            persons=[ada_id, unnamed_id],
+            person_match="all",
+            session_factory=factory,
+        )
+    ] == ["combined.jpg"]
+    assert catalog.list_images(
+        root=root,
+        directory="b",
+        persons=[ada_id, unnamed_id],
+        person_match="all",
+        session_factory=factory,
+    ) == []
+    assert [
+        Path(row.path).name
+        for row in catalog.list_images(
+            root=root, persons=["Ada"], session_factory=factory
+        )
+    ] == ["combined.jpg", "ada.jpg"]
+
+    calendar = catalog.calendar_groups(
+        root=root,
+        persons=[ada_id, unnamed_id],
+        person_match="all",
+        session_factory=factory,
+    )
+    assert list(calendar) == [datetime(2026, 2, 1).date()]
+    assert [Path(row.path).name for rows in calendar.values() for row in rows] == [
+        "combined.jpg"
+    ]
+
+
 def test_analysis_target_selection_scopes_root_and_retries_explicit_errors(tmp_path):
     factory = database()
     root = tmp_path / "images"
