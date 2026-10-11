@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
+import os
 from pathlib import Path
 from typing import Any
 
 from sqlalchemy import delete, select, update
 
-from imagelib.db.models import Face, Image, Person
+from imagelib.db.models import Face, FaceMatchDecision, Image, ImageLocation, Person
 from imagelib.db.session import SessionLocal
 from imagelib.diagnostics import diagnostic
 from imagelib.services.analysis_clustering import (
@@ -29,6 +30,36 @@ def _path_is_under(path: Path, root: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _location_paths(
+    image: Image,
+    selected_root: Path | None = None,
+    *,
+    usable_only: bool = True,
+) -> list[Path]:
+    paths = []
+    for location in image.locations:
+        path = Path(location.path).expanduser().resolve()
+        if selected_root is not None and not _path_is_under(path, selected_root):
+            continue
+        if usable_only and (not path.is_file() or not os.access(path, os.R_OK)):
+            continue
+        paths.append(path)
+    return sorted(set(paths), key=str)
+
+
+def _location_path_for(
+    image: Image,
+    selected_root: Path | None = None,
+    requested_paths: set[str] | None = None,
+) -> Path | None:
+    paths = _location_paths(image, selected_root)
+    if requested_paths:
+        requested = [path for path in paths if str(path) in requested_paths]
+        if requested:
+            return requested[0]
+    return paths[0] if paths else None
 
 
 def select_analysis_targets(
@@ -68,15 +99,19 @@ def select_analysis_targets(
             include_errors,
             force,
         )
-        return [
-            AnalysisTarget(
-                id=image.id,
-                path=image.path,
-                content_hash=image.content_hash,
-                status=image.status,
-            )
-            for image in rows
-        ]
+        targets = []
+        for image in rows:
+            path = _location_path_for(image, selected_root, requested_paths)
+            if path is not None:
+                targets.append(
+                    AnalysisTarget(
+                        id=image.id,
+                        path=str(path),
+                        content_hash=image.content_hash,
+                        status=image.status,
+                    )
+                )
+        return targets
 
 
 def analysis_targets(**kwargs) -> list[AnalysisTarget]:
@@ -96,9 +131,12 @@ def _select_analysis_targets(
     candidates = list(session.scalars(select(Image).order_by(Image.id)))
     result = []
     for image in candidates:
-        if selected_root is not None and not _path_is_under(Path(image.path), selected_root):
+        locations = _location_paths(image, selected_root)
+        if not locations:
             continue
-        if explicit and image.id not in requested_ids and str(Path(image.path).resolve()) not in requested_paths:
+        if explicit and image.id not in requested_ids and not any(
+            str(path) in requested_paths for path in locations
+        ):
             continue
         if force:
             result.append(image)
@@ -107,7 +145,7 @@ def _select_analysis_targets(
         elif explicit and include_errors and image.status == "error":
             result.append(image)
         elif explicit and image.status == "error" and (
-            image.id in requested_ids or str(Path(image.path).resolve()) in requested_paths
+            image.id in requested_ids or any(str(path) in requested_paths for path in locations)
         ):
             result.append(image)
     return result
@@ -143,6 +181,7 @@ def _delete_image_faces(session, image_id: int) -> None:
             .where(Person.cover_face_id.in_(face_ids))
             .values(cover_face_id=None)
         )
+        session.execute(delete(FaceMatchDecision).where(FaceMatchDecision.face_id.in_(face_ids)))
     session.execute(delete(Face).where(Face.image_id == image_id))
 
 
@@ -169,6 +208,7 @@ def persist_worker_response(
     response: Mapping[str, Any] | Sequence[Mapping[str, Any]],
     *,
     expected_content_hash: str | None = None,
+    expected_path: str | Path | None = None,
     session_factory=SessionLocal,
 ) -> WorkerAnalysisResult:
     """Atomically persist one Qt-worker response without importing DeepFace.
@@ -200,7 +240,40 @@ def persist_worker_response(
                     error="Image content hash changed before the worker response arrived",
                 )
             try:
-                current_hash = sha256_file(Path(image.path))
+                if expected_path is not None:
+                    current_path = Path(expected_path).expanduser().resolve()
+                    location_exists = session.scalar(
+                        select(ImageLocation.id)
+                        .where(
+                            ImageLocation.image_id == image.id,
+                            ImageLocation.path == str(current_path),
+                        )
+                        .limit(1)
+                    )
+                    if location_exists is None:
+                        return _worker_result(
+                            image,
+                            accepted=False,
+                            status="stale",
+                            error="Analysis location was removed before the worker response arrived",
+                        )
+                else:
+                    current_path = _location_path_for(image)
+                    if current_path is None:
+                        return _worker_result(
+                            image,
+                            accepted=False,
+                            status="stale",
+                            error="Image has no currently usable location",
+                        )
+                if not current_path.is_file() or not os.access(current_path, os.R_OK):
+                    return _worker_result(
+                        image,
+                        accepted=False,
+                        status="stale",
+                        error="Analysis location is no longer readable",
+                    )
+                current_hash = sha256_file(current_path)
             except OSError as exc:
                 return _worker_result(image, accepted=False, status="stale", error=_worker_error_text(exc))
             if current_hash != expected_content_hash:
@@ -275,6 +348,7 @@ def persist_worker_faces(
     faces: Sequence[Mapping[str, Any]],
     *,
     expected_content_hash: str | None = None,
+    expected_path: str | Path | None = None,
     session_factory=SessionLocal,
 ) -> WorkerAnalysisResult:
     """Persist raw face dictionaries; convenience wrapper around the envelope API."""
@@ -282,6 +356,7 @@ def persist_worker_faces(
         image_id,
         faces,
         expected_content_hash=expected_content_hash,
+        expected_path=expected_path,
         session_factory=session_factory,
     )
 
@@ -335,6 +410,7 @@ def persist_worker_batch(
             target.id,
             response,
             expected_content_hash=target.content_hash,
+            expected_path=target.path,
             session_factory=session_factory,
         )
         result_list.append(result)
