@@ -18,7 +18,7 @@ def get_session() -> Iterator[Session]:
 
 
 def create_schema() -> None:
-    """Create tables via metadata (dev convenience; init_db.sql is authoritative)."""
+    """Create ORM tables for development; init_db.sql is the fresh-DB baseline."""
     from imagelib.db import models  # noqa: F401
 
     models.Base.metadata.create_all(bind=engine)
