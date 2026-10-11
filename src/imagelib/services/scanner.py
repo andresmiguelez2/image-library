@@ -171,11 +171,15 @@ def _remove_faces(session, image_id: int) -> None:
     session.execute(delete(Face).where(Face.image_id == image_id))
 
 
-def _source_path(path: Path) -> Path:
+def _source_path(path: Path, fallback_root: Path | None = None) -> Path:
     """Return the deepest configured watched root containing ``path``."""
-    roots = watched_directories()
+    roots = [Path(root).expanduser().resolve() for root in watched_directories()]
     matching = [root for root in roots if _under(path, root)]
-    return max(matching, key=lambda value: len(value.parts)) if matching else path.parent
+    if matching:
+        return max(matching, key=lambda value: len(value.parts))
+    if fallback_root is not None:
+        return Path(fallback_root).expanduser().resolve()
+    return path.parent
 
 
 def _cancelled(cancel: Callable[[], bool] | object | None) -> bool:
@@ -272,8 +276,6 @@ def scan_root(
     report.discovered = len(paths)
     found = {str(path.resolve()) for path in paths}
     with session_factory() as session:
-        source = _source(session, selected_root)
-        session.commit()
         removed_image_ids: set[int] = set()
         removed_thumbnails: set[str] = set()
         for path in paths:
@@ -285,6 +287,7 @@ def scan_root(
                 progress(path)
             content_hash = ""
             try:
+                source = _source(session, _source_path(path, selected_root))
                 content_hash = sha256_file(path)
                 path_string = str(path.resolve())
                 location = session.scalar(
@@ -353,7 +356,7 @@ def scan_root(
                 session.rollback()
                 if content_hash:
                     try:
-                        source = _source(session, selected_root)
+                        source = _source(session, _source_path(path, selected_root))
                         path_string = str(path.resolve())
                         location = session.scalar(
                             select(ImageLocation).where(ImageLocation.path == path_string)

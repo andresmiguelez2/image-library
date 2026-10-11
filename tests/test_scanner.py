@@ -80,6 +80,53 @@ def test_scan_persists_and_skips_unchanged_files(tmp_path, monkeypatch, test_ses
     assert second.unchanged == 1
 
 
+@pytest.mark.parametrize("nested_first", [False, True])
+def test_overlapping_watched_roots_use_deepest_source_in_any_scan_order(
+    tmp_path, monkeypatch, test_session_factory, nested_first
+) -> None:
+    parent = tmp_path / "library"
+    nested = parent / "albums"
+    nested.mkdir(parents=True)
+    photo = nested / "photo.jpg"
+    Image.new("RGB", (10, 8), "red").save(photo)
+    roots = [nested, parent] if nested_first else [parent, nested]
+    monkeypatch.setattr(scanner, "watched_directories", lambda: roots)
+    monkeypatch.setattr(scanner, "thumbnail_directory", lambda: tmp_path / "thumbs")
+
+    report = scanner.scan_watched_dirs(session_factory=test_session_factory)
+
+    with test_session_factory() as session:
+        location = session.scalar(
+            select(ImageLocation).where(ImageLocation.path == str(photo.resolve()))
+        )
+        source = session.get(Source, location.source_id)
+        assert source.path == str(nested.resolve())
+        assert session.scalar(select(ImageRow).where(ImageRow.content_hash == sha256_file(photo)))
+    assert report.complete
+
+
+def test_direct_scan_root_is_source_when_not_a_configured_watched_root(
+    tmp_path, monkeypatch, test_session_factory
+) -> None:
+    requested_root = tmp_path / "unconfigured"
+    nested_directory = requested_root / "album"
+    nested_directory.mkdir(parents=True)
+    photo = nested_directory / "photo.jpg"
+    Image.new("RGB", (10, 8), "red").save(photo)
+    monkeypatch.setattr(scanner, "watched_directories", lambda: [tmp_path / "other"])
+    monkeypatch.setattr(scanner, "thumbnail_directory", lambda: tmp_path / "thumbs")
+
+    report = scanner.scan_root(requested_root, session_factory=test_session_factory)
+
+    with test_session_factory() as session:
+        location = session.scalar(
+            select(ImageLocation).where(ImageLocation.path == str(photo.resolve()))
+        )
+        source = session.get(Source, location.source_id)
+        assert source.path == str(requested_root.resolve())
+    assert report.complete
+
+
 def test_changed_file_removes_old_faces_and_corrupt_file_isolated(
     tmp_path, monkeypatch, test_session_factory
 ) -> None:
