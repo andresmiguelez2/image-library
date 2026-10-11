@@ -241,6 +241,112 @@ def test_catalog_browser_calendar_detail_and_counts(tmp_path):
     assert counts["analysed"] == 1 and counts["indexed"] == 1
 
 
+def test_catalog_deduplicates_locations_and_keeps_offline_entries(tmp_path):
+    factory = database()
+    root = tmp_path / "images"
+    nested = root / "a"
+    other_root = tmp_path / "other"
+    nested.mkdir(parents=True)
+    (root / "z").mkdir()
+    other_root.mkdir()
+    accessible_path = root / "z" / "copy.jpg"
+    accessible_path.write_bytes(b"available")
+    offline_path = nested / "copy.jpg"
+    cached_thumbnail = tmp_path / "thumbnails" / "offline.jpg"
+    cached_thumbnail.parent.mkdir()
+    cached_thumbnail.write_bytes(b"cached thumbnail")
+    missing_path = root / "zz" / "offline.jpg"
+
+    with factory() as session:
+        source = Source(path=str(root))
+        other_source = Source(path=str(other_root))
+        person = Person(name="Ada")
+        session.add_all([source, other_source, person])
+        session.flush()
+        duplicate = add_image(
+            session,
+            source,
+            accessible_path,
+            "duplicate-hash",
+            status="analysed",
+            face_count=1,
+            taken_at=datetime(2026, 4, 5, 12),
+            gps_place="Paris",
+        )
+        session.add_all(
+            [
+                ImageLocation(
+                    image_id=duplicate.id, source_id=source.id, path=str(offline_path)
+                ),
+                ImageLocation(
+                    image_id=duplicate.id,
+                    source_id=other_source.id,
+                    path=str(other_root / "copy.jpg"),
+                ),
+            ]
+        )
+        offline = add_image(
+            session,
+            source,
+            missing_path,
+            "offline-hash",
+            thumb_path=str(cached_thumbnail),
+            status="indexed",
+            taken_at=datetime(2026, 4, 6, 12),
+            width=1200,
+            height=800,
+        )
+        session.add(Face(image_id=duplicate.id, person_id=person.id, x=1, y=2, w=3, h=4))
+        session.commit()
+        duplicate_id = duplicate.id
+        offline_id = offline.id
+        person_id = person.id
+
+    rows = catalog.list_images(root=root, session_factory=factory)
+    nested_rows = catalog.list_images(root=root, directory="a", session_factory=factory)
+    other_root_rows = catalog.list_images(root=other_root, session_factory=factory)
+    filtered_rows = catalog.list_images(
+        root=root,
+        persons=[person_id],
+        locations=["Paris"],
+        date_from=date(2026, 4, 5),
+        date_to=date(2026, 4, 5),
+        session_factory=factory,
+    )
+    calendar = catalog.calendar_groups(root=root, session_factory=factory)
+    counts = catalog.status_counts(root=root, session_factory=factory)
+    groups = catalog.list_person_groups(root=root, session_factory=factory)
+    detail = catalog.get_image_detail(duplicate_id, root=root, session_factory=factory)
+    nested_detail = catalog.get_image_detail(duplicate_id, root=nested, session_factory=factory)
+    offline_detail = catalog.get_image_detail(offline_id, root=root, session_factory=factory)
+
+    assert [row.id for row in rows] == [duplicate_id, offline_id]
+    assert len({row.id for row in rows}) == len(rows)
+    assert rows[0].path == str(accessible_path.resolve())
+    assert [row.id for row in nested_rows] == [duplicate_id]
+    assert nested_rows[0].relative_path == "a/copy.jpg"
+    assert [row.id for row in other_root_rows] == [duplicate_id]
+    assert other_root_rows[0].path == str((other_root / "copy.jpg").resolve())
+    assert [row.id for row in filtered_rows] == [duplicate_id]
+    assert [item.id for day in calendar.values() for item in day] == [duplicate_id, offline_id]
+    assert counts == {"pending": 0, "indexed": 1, "analysed": 1, "error": 0}
+    assert len(groups) == 1
+    assert groups[0].person_id == person_id
+    assert groups[0].face_count == 1 and groups[0].image_count == 1
+    assert groups[0].representative_image_path == str(accessible_path.resolve())
+    assert detail is not None and detail.path == str(accessible_path.resolve())
+    assert detail.taken_at == datetime(2026, 4, 5, 12)
+    assert detail.faces[0].person_name == "Ada"
+    assert nested_detail is not None and nested_detail.path == str(offline_path.resolve())
+    assert offline_detail is not None
+    assert offline_detail.path == str(missing_path.resolve())
+    assert offline_detail.thumb_path == str(cached_thumbnail)
+    assert (offline_detail.width, offline_detail.height) == (1200, 800)
+    assert catalog.get_image_detail(
+        path=offline_path, root=root, session_factory=factory
+    ).path == str(accessible_path.resolve())
+
+
 def test_catalog_person_groups_and_any_all_search_are_root_scoped(tmp_path):
     factory = database()
     root = tmp_path / "images"
