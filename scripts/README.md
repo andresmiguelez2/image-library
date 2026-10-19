@@ -9,6 +9,19 @@ export IMAGELIB_DSN='postgresql://imagelib:imagelib@localhost:5432/imagelib'
 psql -v ON_ERROR_STOP=1 "$IMAGELIB_DSN" -f scripts/001_face_labelling.sql
 ```
 
+The `003_clear_catalog.sql` migration installs only the `public.clear_catalog()`
+function; applying it does not call the function or change catalogue rows. It
+can be installed before or after the optional `image_locations` table exists.
+Fresh databases receive the same function definition from `init_db.sql`.
+
+`clear_catalog()` is destructive and must only be invoked deliberately with
+`SELECT public.clear_catalog();`. It deletes rows from `sources`, `images`,
+`faces`, `persons`, and `face_match_decisions`, plus `image_locations` when that
+table exists, and restarts their serial/identity sequences. It stops with an
+error if any required table is missing. The function uses invoker privileges
+and does not cascade into other tables. It never deletes original image files
+or the thumbnail cache; it only removes catalogue rows and their stored paths.
+
 The migration adds the unique constraint on non-NULL person names and the
 `face_match_decisions` table. It checks for duplicate labels before changing
 the schema and aborts with the conflicting labels; resolve duplicates manually

@@ -78,3 +78,62 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_face_match_decisions_one_accepted_per_face
 -- Similarity search for face matching (cosine distance).
 CREATE INDEX IF NOT EXISTS idx_faces_embedding
     ON faces USING hnsw (embedding vector_cosine_ops);
+
+CREATE OR REPLACE FUNCTION public.clear_catalog()
+RETURNS void
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = pg_catalog
+AS $clear_catalog$
+DECLARE
+    required_table TEXT;
+    table_name TEXT;
+    sequence_name TEXT;
+BEGIN
+    FOREACH required_table IN ARRAY ARRAY[
+        'sources',
+        'images',
+        'faces',
+        'persons',
+        'face_match_decisions'
+    ] LOOP
+        IF to_regclass(format('public.%I', required_table)) IS NULL THEN
+            RAISE EXCEPTION
+                'Cannot clear catalogue: required table public.% is missing',
+                required_table;
+        END IF;
+    END LOOP;
+
+    LOCK TABLE public.sources,
+        public.images,
+        public.faces,
+        public.persons,
+        public.face_match_decisions
+        IN ACCESS EXCLUSIVE MODE;
+
+    IF to_regclass('public.image_locations') IS NOT NULL THEN
+        EXECUTE 'LOCK TABLE public.image_locations IN ACCESS EXCLUSIVE MODE';
+        EXECUTE 'DELETE FROM public.image_locations';
+    END IF;
+
+    DELETE FROM public.face_match_decisions;
+    DELETE FROM public.faces;
+    DELETE FROM public.persons;
+    DELETE FROM public.images;
+    DELETE FROM public.sources;
+
+    FOREACH table_name IN ARRAY ARRAY['sources', 'images', 'faces', 'persons'] LOOP
+        sequence_name := pg_get_serial_sequence(format('public.%I', table_name), 'id');
+        IF sequence_name IS NOT NULL THEN
+            EXECUTE format('ALTER SEQUENCE %s RESTART WITH 1', sequence_name::regclass);
+        END IF;
+    END LOOP;
+
+    IF to_regclass('public.image_locations') IS NOT NULL THEN
+        sequence_name := pg_get_serial_sequence('public.image_locations', 'id');
+        IF sequence_name IS NOT NULL THEN
+            EXECUTE format('ALTER SEQUENCE %s RESTART WITH 1', sequence_name::regclass);
+        END IF;
+    END IF;
+END;
+$clear_catalog$;
