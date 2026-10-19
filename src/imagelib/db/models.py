@@ -39,7 +39,9 @@ class Source(Base):
     enabled: Mapped[bool] = mapped_column(default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.now)
 
-    images: Mapped[list["Image"]] = relationship(back_populates="source")
+    locations: Mapped[list["ImageLocation"]] = relationship(
+        back_populates="source", cascade="all, delete", passive_deletes=True
+    )
 
 
 class Person(Base):
@@ -59,16 +61,15 @@ class Person(Base):
 
 
 class Image(Base):
-    """One indexed image file and its metadata/status."""
+    """One logical image, identified by its content hash."""
 
     __tablename__ = "images"
     __table_args__ = (
         CheckConstraint("status IN ('pending','indexed','analysed','error')", name="ck_images_status"),
+        UniqueConstraint("content_hash", name="uq_images_content_hash"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    source_id: Mapped[int] = mapped_column(ForeignKey("sources.id", ondelete="CASCADE"))
-    path: Mapped[str] = mapped_column(String, unique=True)
     content_hash: Mapped[str] = mapped_column(String)
     size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     width: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -87,8 +88,29 @@ class Image(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.now, onupdate=datetime.now)
 
-    source: Mapped[Source] = relationship(back_populates="images")
+    locations: Mapped[list["ImageLocation"]] = relationship(
+        back_populates="image", cascade="all, delete-orphan"
+    )
     faces: Mapped[list["Face"]] = relationship(back_populates="image", cascade="all, delete-orphan")
+
+
+class ImageLocation(Base):
+    """A watched-source path at which a logical image is stored."""
+
+    __tablename__ = "image_locations"
+    __table_args__ = (
+        UniqueConstraint("path", name="uq_image_locations_path"),
+        Index("ix_image_locations_image_id", "image_id"),
+        Index("ix_image_locations_source_id", "source_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    image_id: Mapped[int] = mapped_column(ForeignKey("images.id", ondelete="CASCADE"))
+    source_id: Mapped[int] = mapped_column(ForeignKey("sources.id", ondelete="CASCADE"))
+    path: Mapped[str] = mapped_column(String)
+
+    image: Mapped[Image] = relationship(back_populates="locations")
+    source: Mapped[Source] = relationship(back_populates="locations")
 
 
 class Face(Base):

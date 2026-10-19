@@ -1,11 +1,12 @@
 from io import BytesIO
 from pathlib import Path
 
+from PIL import Image as PillowImage
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from imagelib.db.models import Base, Face, Image, Person, Source
+from imagelib.db.models import Base, Face, Image, ImageLocation, Person, Source
 from imagelib.services import (
     analysis_clustering,
     analysis_persistence,
@@ -77,9 +78,10 @@ def test_analyser_reuses_model_and_persists_faces(tmp_path: Path, monkeypatch) -
         source = Source(path=str(tmp_path))
         session.add(source)
         session.flush()
-        session.add(
-            Image(path=str(image_path), source_id=source.id, content_hash="hash", status="indexed")
-        )
+        image = Image(content_hash=scanner.sha256_file(image_path), status="indexed")
+        session.add(image)
+        session.flush()
+        session.add(ImageLocation(image_id=image.id, source_id=source.id, path=str(image_path)))
         session.commit()
 
     calls = []
@@ -152,10 +154,14 @@ def _analysis_database(tmp_path: Path, count: int):
         session.flush()
         for index in range(count):
             path = tmp_path / f"photo-{index}.jpg"
-            path.write_bytes(b"fixture")
-            session.add(
-                Image(path=str(path), source_id=source.id, content_hash=str(index), status="indexed")
+            path.write_bytes(f"fixture-{index}".encode())
+            image = Image(
+                content_hash=scanner.sha256_file(path),
+                status="indexed",
             )
+            session.add(image)
+            session.flush()
+            session.add(ImageLocation(image_id=image.id, source_id=source.id, path=str(path)))
         session.commit()
     return factory
 
@@ -205,7 +211,9 @@ def test_reanalysis_removes_stale_clusters_and_handles_no_face(tmp_path: Path, m
     analyser.analyse_images(session_factory=factory)
 
     with factory() as session:
-        image = session.scalar(select(Image).where(Image.path.like("%photo-0.jpg")))
+        image = session.scalar(
+            select(Image).join(ImageLocation).where(ImageLocation.path.like("%photo-0.jpg"))
+        )
         image.status = "indexed"
         session.commit()
     monkeypatch.setattr(analyser, "_represent", lambda path, model: [])
@@ -216,5 +224,83 @@ def test_reanalysis_removes_stale_clusters_and_handles_no_face(tmp_path: Path, m
         remaining_face = session.scalar(select(Face))
         assert remaining_face is not None
         assert remaining_face.person_id is None
-        removed = session.scalar(select(Image).where(Image.path.like("%photo-0.jpg")))
+        removed = session.scalar(
+            select(Image).join(ImageLocation).where(ImageLocation.path.like("%photo-0.jpg"))
+        )
         assert removed.face_count == 0
+
+
+def test_identical_copies_are_analysed_once_and_share_logical_faces(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "images"
+    root.mkdir()
+    first = root / "one.jpg"
+    second = root / "two.jpg"
+    PillowImage.new("RGB", (10, 8), "red").save(first)
+    second.write_bytes(first.read_bytes())
+    factory = _analysis_database_for_root(root)
+    monkeypatch.setattr(scanner, "thumbnail_directory", lambda: tmp_path / "thumbs")
+    scanner.scan_root(root, session_factory=factory)
+    calls = []
+    monkeypatch.setattr(analyser, "_get_model", lambda: object())
+    monkeypatch.setattr(
+        analyser,
+        "_represent",
+        lambda path, model: calls.append(path) or [_face([1.0] + [0.0] * 511)],
+    )
+
+    targets = analyser.select_analysis_targets(root=root, session_factory=factory)
+    report = analyser.analyse_images(root=root, session_factory=factory)
+    with factory() as session:
+        face_id = session.scalar(select(Face.id))
+    third = root / "three.jpg"
+    third.write_bytes(first.read_bytes())
+    scanner.scan_root(root, session_factory=factory)
+    second_report = analyser.analyse_images(root=root, session_factory=factory)
+
+    with factory() as session:
+        images = list(session.scalars(select(Image)))
+        locations = list(session.scalars(select(ImageLocation)))
+        faces = list(session.scalars(select(Face)))
+        assert len(images) == 1
+        assert len(locations) == 3
+        assert len(faces) == 1 and faces[0].id == face_id and faces[0].image_id == images[0].id
+    assert len(targets) == 1
+    assert report.analysed == 1
+    assert second_report.analysed == 0 and second_report.discovered == 0
+    assert calls == [Path(targets[0].path)]
+
+
+def test_analysis_skips_images_with_no_usable_locations(tmp_path) -> None:
+    root = tmp_path / "images"
+    root.mkdir()
+    image_path = root / "offline.jpg"
+    image_path.write_bytes(b"offline contents")
+    factory = _analysis_database_for_root(root)
+    with factory() as session:
+        source = session.scalar(select(Source).where(Source.path == str(root)))
+        image = Image(content_hash=scanner.sha256_file(image_path), status="analysed", face_count=1)
+        session.add(image)
+        session.flush()
+        session.add(ImageLocation(image_id=image.id, source_id=source.id, path=str(image_path)))
+        session.add(Face(image_id=image.id, x=1, y=1, w=2, h=2))
+        session.commit()
+        image_id = image.id
+    image_path.unlink()
+
+    assert analyser.select_analysis_targets(root=root, force=True, session_factory=factory) == []
+    with factory() as session:
+        image = session.get(Image, image_id)
+        assert image.status == "analysed" and image.face_count == 1
+        assert session.scalar(select(Face).where(Face.image_id == image_id)) is not None
+
+
+def _analysis_database_for_root(root: Path):
+    engine = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+    )
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    with factory() as session:
+        session.add(Source(path=str(root)))
+        session.commit()
+    return factory

@@ -10,10 +10,17 @@ from pathlib import Path
 from typing import Literal
 
 from sqlalchemy import select
-from sqlalchemy.orm import aliased
+from sqlalchemy.orm import aliased, selectinload
 
 from imagelib.config import active_root
-from imagelib.db.models import IMAGE_STATUSES, Face, FaceMatchDecision, Image, Person
+from imagelib.db.models import (
+    IMAGE_STATUSES,
+    Face,
+    FaceMatchDecision,
+    Image,
+    ImageLocation,
+    Person,
+)
 from imagelib.db.session import SessionLocal
 
 
@@ -32,6 +39,13 @@ class ImageListItem:
     height: int | None
     face_count: int
     status: str
+
+
+@dataclass(frozen=True)
+class _RootImage:
+    image: Image
+    path: str
+    paths: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -119,25 +133,55 @@ def _root(root: str | Path | None) -> Path:
     return active_root(root)
 
 
-def _under(path: Path, root: Path) -> bool:
+def _resolved_path(path: str | Path, root: Path | None = None) -> Path:
+    value = Path(path).expanduser()
+    if not value.is_absolute() and root is not None:
+        value = root / value
     try:
-        path.resolve().relative_to(root.resolve())
+        return value.resolve()
+    except (OSError, RuntimeError):
+        return value.absolute()
+
+
+def _under(path: str | Path, root: Path) -> bool:
+    try:
+        _resolved_path(path, root).relative_to(_resolved_path(root))
         return True
     except ValueError:
         return False
 
 
 def _relative(path: str, root: Path) -> tuple[str, tuple[str, ...]]:
-    relative = Path(path).resolve().relative_to(root.resolve())
+    relative = _resolved_path(path, root).relative_to(_resolved_path(root))
     parts = relative.parts
     return relative.as_posix(), parts
 
 
-def _list_item(image: Image, root: Path) -> ImageListItem:
-    relative_path, breadcrumbs = _relative(image.path, root)
+def _location_paths(image: Image, root: Path | None = None) -> tuple[str, ...]:
+    paths = []
+    for location in image.locations:
+        path = _resolved_path(location.path, root)
+        if root is not None and not _under(path, root):
+            continue
+        try:
+            accessible = path.is_file()
+        except OSError:
+            accessible = False
+        paths.append((not accessible, path.as_posix()))
+    return tuple(path for _inaccessible, path in sorted(paths))
+
+
+def _location_path(image: Image, root: Path | None = None) -> str | None:
+    paths = _location_paths(image, root)
+    return paths[0] if paths else None
+
+
+def _list_item(record: _RootImage, root: Path) -> ImageListItem:
+    image = record.image
+    relative_path, breadcrumbs = _relative(record.path, root)
     return ImageListItem(
         id=image.id,
-        path=image.path,
+        path=record.path,
         relative_path=relative_path,
         breadcrumbs=breadcrumbs,
         thumb_path=image.thumb_path,
@@ -162,12 +206,15 @@ def _calendar_item_sort_key(item: ImageListItem) -> tuple[datetime, str, int]:
     return timestamp, item.relative_path, item.id
 
 
-def _images_in_root(session, root: Path) -> list[Image]:
-    return [
-        image
-        for image in session.scalars(select(Image).order_by(Image.path))
-        if _under(Path(image.path), root)
-    ]
+def _images_in_root(session, root: Path) -> list[_RootImage]:
+    records = []
+    for image in session.scalars(
+        select(Image).options(selectinload(Image.locations)).order_by(Image.id)
+    ):
+        paths = _location_paths(image, root)
+        if paths:
+            records.append(_RootImage(image, paths[0], paths))
+    return sorted(records, key=lambda record: (_relative(record.path, root)[0], record.image.id))
 
 
 def list_person_groups(
@@ -177,7 +224,8 @@ def list_person_groups(
     selected_root = _root(root)
     with session_factory() as session:
         images = _images_in_root(session, selected_root)
-        image_ids = {image.id for image in images}
+        image_paths = {record.image.id: record.path for record in images}
+        image_ids = set(image_paths)
         if not image_ids:
             return []
 
@@ -213,14 +261,14 @@ def list_person_groups(
                     representative_face_w=face.w,
                     representative_face_h=face.h,
                     representative_image_id=image.id,
-                    representative_image_path=image.path,
+                    representative_image_path=image_paths[image.id],
                     representative_thumbnail_path=image.thumb_path,
                 )
             )
         return result
 
 
-def filter_images(
+def _filter_image_records(
     *,
     persons: Iterable[int | str] | None = None,
     locations: Iterable[str] | None = None,
@@ -230,15 +278,8 @@ def filter_images(
     person_match: Literal["any", "all"] = "any",
     root: str | Path | None = None,
     session_factory=SessionLocal,
-) -> list[Image]:
-    """Return ORM image rows matching common catalog filters.
-
-    ``root`` scopes results to the active root.  The returned rows are fully
-    scalar-loaded and can be converted with :func:`list_images` for UI use.
-    ``persons`` accepts person IDs and/or names; ``person_match`` controls
-    whether any or all selected people must appear. ``locations`` matches
-    ``gps_place``. A true ``face_count`` asks for images containing faces.
-    """
+) -> list[_RootImage]:
+    """Return unique root-scoped image/location records matching filters."""
     if person_match not in {"any", "all"}:
         raise ValueError("person_match must be 'any' or 'all'")
     selected_root = _root(root)
@@ -258,7 +299,8 @@ def filter_images(
         upper_bound = (
             datetime.combine(date_to, time.max) if isinstance(date_to, date) and not isinstance(date_to, datetime) else date_to
         )
-        for image in images:
+        for record in images:
+            image = record.image
             if lower_bound is not None and (image.taken_at is None or image.taken_at < lower_bound):
                 continue
             if upper_bound is not None and (image.taken_at is None or image.taken_at > upper_bound):
@@ -289,8 +331,42 @@ def filter_images(
                     matches = not selected_values.isdisjoint(matched_values)
                 if not matches:
                     continue
-            result.append(image)
+            result.append(record)
         return result
+
+
+def filter_images(
+    *,
+    persons: Iterable[int | str] | None = None,
+    locations: Iterable[str] | None = None,
+    date_from: datetime | date | None = None,
+    date_to: datetime | date | None = None,
+    face_count: int | bool | None = None,
+    person_match: Literal["any", "all"] = "any",
+    root: str | Path | None = None,
+    session_factory=SessionLocal,
+) -> list[Image]:
+    """Return ORM image rows matching common catalog filters.
+
+    ``root`` scopes results to the active root.  The returned rows are fully
+    scalar-loaded and can be converted with :func:`list_images` for UI use.
+    ``persons`` accepts person IDs and/or names; ``person_match`` controls
+    whether any or all selected people must appear. ``locations`` matches
+    ``gps_place``. A true ``face_count`` asks for images containing faces.
+    """
+    return [
+        record.image
+        for record in _filter_image_records(
+            persons=persons,
+            locations=locations,
+            date_from=date_from,
+            date_to=date_to,
+            face_count=face_count,
+            person_match=person_match,
+            root=root,
+            session_factory=session_factory,
+        )
+    ]
 
 
 def list_images(
@@ -309,7 +385,7 @@ def list_images(
 ) -> list[ImageListItem]:
     """List browser rows with root-relative paths and breadcrumb parts."""
     selected_root = _root(root)
-    rows = filter_images(
+    rows = _filter_image_records(
         persons=persons,
         locations=locations,
         date_from=date_from,
@@ -326,14 +402,21 @@ def list_images(
                 selected_directory = selected_directory.resolve().relative_to(selected_root)
             except ValueError:
                 return []
-        directory_text = selected_directory.as_posix().strip(".").strip("/")
-        rows = [
-            row
-            for row in rows
-            if not directory_text
-            or Path(row.path).resolve().relative_to(selected_root).parent.as_posix()
-            == directory_text
-        ]
+        directory_text = selected_directory.as_posix().strip("/")
+        if directory_text in {"", "."}:
+            directory_text = ""
+        if directory_text:
+            directory_rows = []
+            for row in rows:
+                matching_paths = tuple(
+                    path
+                    for path in row.paths
+                    if Path(_relative(path, selected_root)[0]).parent.as_posix()
+                    == directory_text
+                )
+                if matching_paths:
+                    directory_rows.append(_RootImage(row.image, matching_paths[0], matching_paths))
+            rows = directory_rows
     rows = rows[offset: (offset + limit) if limit is not None else None]
     return [_list_item(row, selected_root) for row in rows]
 
@@ -361,7 +444,7 @@ def calendar_groups(
 ) -> dict[date | None, list[ImageListItem]]:
     """Filter root images, then group by capture date or file modification date."""
     selected_root = _root(root)
-    images = filter_images(
+    images = _filter_image_records(
         persons=persons,
         locations=locations,
         date_from=date_from,
@@ -372,10 +455,11 @@ def calendar_groups(
         session_factory=session_factory,
     )
     groups: dict[date | None, list[ImageListItem]] = {}
-    for image in images:
+    for record in images:
+        image = record.image
         timestamp = image.taken_at or image.modified_at
         group = timestamp.date() if timestamp is not None else None
-        groups.setdefault(group, []).append(_list_item(image, selected_root))
+        groups.setdefault(group, []).append(_list_item(record, selected_root))
     return dict(sorted(groups.items(), key=lambda item: (item[0] is None, item[0] or date.min)))
 
 
@@ -388,7 +472,9 @@ def status_counts(*, root: str | Path | None = None, session_factory=SessionLoca
     """Return counts for every image status below the active root."""
     selected_root = _root(root)
     with session_factory() as session:
-        counts = Counter(image.status for image in _images_in_root(session, selected_root))
+        counts = Counter(
+            record.image.status for record in _images_in_root(session, selected_root)
+        )
     return {status: counts.get(status, 0) for status in IMAGE_STATUSES}
 
 
@@ -414,16 +500,21 @@ def get_image_detail(
         raise ValueError("image_id or path is required")
     selected_root = _root(root)
     with session_factory() as session:
-        statement = select(Image)
+        statement = select(Image).options(selectinload(Image.locations))
         if image_id is not None:
             statement = statement.where(Image.id == image_id)
         else:
             requested_path = Path(path).expanduser()
             if not requested_path.is_absolute():
                 requested_path = selected_root / requested_path
-            statement = statement.where(Image.path == str(requested_path.resolve()))
+            statement = (
+                statement.join(ImageLocation, ImageLocation.image_id == Image.id)
+                .where(ImageLocation.path == _resolved_path(requested_path).as_posix())
+                .distinct()
+            )
         image = session.scalar(statement)
-        if image is None or not _under(Path(image.path), selected_root):
+        selected_path = _location_path(image, selected_root) if image is not None else None
+        if image is None or selected_path is None:
             return None
         faces = session.execute(
             select(Face, Person.name)
@@ -431,10 +522,10 @@ def get_image_detail(
             .where(Face.image_id == image.id)
             .order_by(Face.id)
         ).all()
-        relative_path, breadcrumbs = _relative(image.path, selected_root)
+        relative_path, breadcrumbs = _relative(selected_path, selected_root)
         return ImageDetail(
             id=image.id,
-            path=image.path,
+            path=selected_path,
             relative_path=relative_path,
             breadcrumbs=breadcrumbs,
             thumb_path=image.thumb_path,
@@ -492,6 +583,10 @@ def list_pending_face_match_proposals(
     target_face_alias = aliased(Face)
     target_image_alias = aliased(Image)
     with session_factory() as session:
+        images = _images_in_root(session, selected_root)
+        image_paths = {record.image.id: record.path for record in images}
+        if not image_paths:
+            return []
         rows = session.execute(
             select(
                 FaceMatchDecision,
@@ -515,15 +610,13 @@ def list_pending_face_match_proposals(
             )
             .order_by(target_alias.name, group_alias.id, Face.id)
         ).all()
-        scoped: dict[
-            tuple[int, int],
-            list[tuple[Face, Person, Person, Image, Face | None, Image | None]],
-        ] = {}
+        scoped: dict[tuple[int, int], list[tuple]] = {}
         for _, face, target, group, image, target_face, target_image in rows:
-            if not _under(Path(image.path), selected_root):
+            sample_path = image_paths.get(image.id)
+            if sample_path is None:
                 continue
             scoped.setdefault((group.id, target.id), []).append(
-                (face, target, group, image, target_face, target_image)
+                (face, target, group, image, target_face, target_image, sample_path)
             )
         if not scoped:
             return []
@@ -537,7 +630,7 @@ def list_pending_face_match_proposals(
 
         proposals = []
         for (group_id, _), group_rows in scoped.items():
-            face, target, group, image, target_face, target_image = group_rows[0]
+            face, target, group, image, target_face, target_image, sample_path = group_rows[0]
             all_faces = group_faces.get(group_id, [])
             embeddings = [member.embedding for member in all_faces if member.embedding is not None]
             centroid = None
@@ -547,7 +640,7 @@ def list_pending_face_match_proposals(
                     for index in range(len(embeddings[0]))
                 ]
             sample = min(group_rows, key=lambda row: row[0].id)
-            face, target, group, image, target_face, target_image = sample
+            face, target, group, image, target_face, target_image, sample_path = sample
             target_person_name = target.name
             if target_person_name is None:
                 continue
@@ -560,7 +653,7 @@ def list_pending_face_match_proposals(
                     face_count=len(all_faces),
                     similarity=_cosine_similarity(target.embedding, centroid),
                     sample_image_id=image.id,
-                    sample_image_path=image.path,
+                    sample_image_path=sample_path,
                     sample_thumbnail_path=image.thumb_path,
                     face_x=face.x,
                     face_y=face.y,
@@ -569,7 +662,12 @@ def list_pending_face_match_proposals(
                     confidence=face.confidence,
                     target_face_id=target_face.id if target_face is not None else None,
                     target_sample_image_id=target_image.id if target_image is not None else None,
-                    target_sample_image_path=target_image.path if target_image is not None else None,
+                    target_sample_image_path=(
+                        _location_path(target_image, selected_root)
+                        or _location_path(target_image)
+                        if target_image is not None
+                        else None
+                    ),
                     target_sample_thumbnail_path=(
                         target_image.thumb_path if target_image is not None else None
                     ),

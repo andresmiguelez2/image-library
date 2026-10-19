@@ -22,6 +22,7 @@ from imagelib.services.analysis_persistence import (
     _delete_image_faces,
     _face_values,
     _mark_error,
+    _location_path_for,
     _path_is_under,
     _select_analysis_targets,
     _worker_error_text,
@@ -56,6 +57,10 @@ _model = None
 _model_lock = Lock()
 
 
+class _StaleImageError(Exception):
+    pass
+
+
 def _get_model():
     global _model
     if _model is None:
@@ -77,6 +82,15 @@ def _represent(path: Path, model) -> list[dict]:
         enforce_detection=False,
     )
     return result if isinstance(result, list) else [result]
+
+
+def _assert_current_hash(path: Path, expected_hash: str, when: str) -> None:
+    try:
+        current_hash = sha256_file(path)
+    except OSError as exc:
+        raise _StaleImageError(f"Image location became unavailable {when}: {exc}") from exc
+    if current_hash != expected_hash:
+        raise _StaleImageError(f"Image content hash changed {when}")
 
 
 def analyse_images(
@@ -126,10 +140,24 @@ def analyse_images(
         for image in targets:
             if progress:
                 progress(image)
+            path = _location_path_for(image, selected_root, requested_paths)
+            if path is None:
+                report.errors += 1
+                results.append(
+                    _worker_result(
+                        image,
+                        accepted=False,
+                        status="stale",
+                        error="Image has no currently usable location",
+                    )
+                )
+                continue
             try:
                 if model_error is not None:
                     raise model_error
-                values = [_face_values(item) for item in _represent(Path(image.path), model)]
+                _assert_current_hash(path, image.content_hash, "before analysis began")
+                values = [_face_values(item) for item in _represent(path, model)]
+                _assert_current_hash(path, image.content_hash, "during analysis")
                 _delete_image_faces(session, image.id)
                 for x, y, width, height, confidence, embedding in values:
                     if width <= 0 or height <= 0:
@@ -157,6 +185,16 @@ def analyse_images(
                         accepted=True,
                         status="analysed",
                         face_count=image.face_count,
+                    )
+                )
+            except _StaleImageError as exc:
+                report.errors += 1
+                results.append(
+                    _worker_result(
+                        image,
+                        accepted=False,
+                        status="stale",
+                        error=str(exc),
                     )
                 )
             except Exception as exc:  # noqa: BLE001

@@ -23,10 +23,17 @@ def _group_for_face(session, face_id: int, root: str | Path | None) -> tuple[Fac
     if image is None:
         raise ValueError(f"Image for face {face_id} no longer exists")
     selected_root = active_root(root)
-    try:
-        Path(image.path).resolve().relative_to(selected_root.resolve())
-    except ValueError as exc:
-        raise ValueError(f"Face {face_id} is outside the selected image root") from exc
+    selected_root = selected_root.resolve()
+    valid_location = next(
+        (
+            location
+            for location in sorted(image.locations, key=lambda item: item.path)
+            if _is_under(Path(location.path), selected_root)
+        ),
+        None,
+    )
+    if valid_location is None:
+        raise ValueError(f"Face {face_id} is outside the selected image root")
     if face.person_id is None:
         raise ValueError(f"Face {face_id} is ungrouped DBSCAN noise and cannot be labelled")
     person = session.scalar(
@@ -61,6 +68,14 @@ def _group_for_face(session, face_id: int, root: str | Path | None) -> tuple[Fac
     if not group or any(member.embedding is None for member in group):
         raise ValueError(f"Face {face_id} does not belong to a labelable analyser group")
     return face, person, group
+
+
+def _is_under(path: Path, root: Path) -> bool:
+    try:
+        path.expanduser().resolve().relative_to(root)
+        return True
+    except ValueError:
+        return False
 
 
 def _decisions_for_group(session, group: Sequence[Face]) -> dict[tuple[int, int], FaceMatchDecision]:

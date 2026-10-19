@@ -11,7 +11,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from imagelib.db.models import Base, Face, Image, Person, Source
+from imagelib.db.models import Base, Face, Image, ImageLocation, Person, Source
 from imagelib.diagnostics import diagnostic
 from imagelib.services import analyser, catalog, scanner
 from imagelib.services.deepface_worker import run_worker
@@ -23,6 +23,14 @@ def database():
     )
     Base.metadata.create_all(engine)
     return sessionmaker(bind=engine, expire_on_commit=False)
+
+
+def add_image(session, source, path, content_hash, **values):
+    image = Image(content_hash=content_hash, **values)
+    session.add(image)
+    session.flush()
+    session.add(ImageLocation(image_id=image.id, source_id=source.id, path=str(path)))
+    return image
 
 
 def test_complete_root_scan_reconciles_missing_rows_and_thumbnail(tmp_path, monkeypatch):
@@ -41,13 +49,9 @@ def test_complete_root_scan_reconciles_missing_rows_and_thumbnail(tmp_path, monk
         old_thumbnail = thumbnail_dir / "old.jpg"
         old_thumbnail.parent.mkdir()
         old_thumbnail.write_bytes(b"thumbnail")
-        stale = Image(
-            source_id=source.id,
-            path=str(root / "gone.jpg"),
-            content_hash="gone",
-            thumb_path=str(old_thumbnail),
+        stale = add_image(
+            session, source, root / "gone.jpg", "gone", thumb_path=str(old_thumbnail)
         )
-        session.add(stale)
         session.flush()
         session.add(Face(image_id=stale.id, x=1, y=1, w=2, h=2))
         session.commit()
@@ -55,7 +59,9 @@ def test_complete_root_scan_reconciles_missing_rows_and_thumbnail(tmp_path, monk
     report = scanner.scan_root(root, session_factory=factory)
 
     with factory() as session:
-        assert session.scalar(select(Image).where(Image.path == str(root / "gone.jpg"))) is None
+        assert session.scalar(
+            select(Image).join(ImageLocation).where(ImageLocation.path == str(root / "gone.jpg"))
+        ) is None
         assert session.scalar(select(Face)) is None
     assert report.complete
     assert report.removed == 1
@@ -71,14 +77,14 @@ def test_complete_root_scan_removes_person_with_only_stale_face(tmp_path):
         person = Person(embedding=[1.0] + [0.0] * 511)
         session.add_all([source, person])
         session.flush()
-        stale = Image(
-            source_id=source.id,
-            path=str(root / "gone.jpg"),
-            content_hash="gone",
+        stale = add_image(
+            session,
+            source,
+            root / "gone.jpg",
+            "gone",
             status="analysed",
             face_count=1,
         )
-        session.add(stale)
         session.flush()
         session.add(
             Face(
@@ -113,21 +119,22 @@ def test_complete_root_scan_refreshes_named_person_with_surviving_face(tmp_path)
         person = Person(name="Ada", embedding=[1.0] + [0.0] * 511)
         session.add_all([source, person])
         session.flush()
-        current = Image(
-            source_id=source.id,
-            path=str(current_path),
-            content_hash=scanner.sha256_file(current_path),
+        current = add_image(
+            session,
+            source,
+            current_path,
+            scanner.sha256_file(current_path),
             status="analysed",
             face_count=1,
         )
-        stale = Image(
-            source_id=source.id,
-            path=str(root / "gone.jpg"),
-            content_hash="gone",
+        stale = add_image(
+            session,
+            source,
+            root / "gone.jpg",
+            "gone",
             status="analysed",
             face_count=1,
         )
-        session.add_all([current, stale])
         session.flush()
         session.add_all(
             [
@@ -175,13 +182,15 @@ def test_cancelled_scan_never_reconciles(tmp_path):
         source = Source(path=str(root))
         session.add(source)
         session.flush()
-        session.add(Image(source_id=source.id, path=str(root / "gone.jpg"), content_hash="gone"))
+        add_image(session, source, root / "gone.jpg", "gone")
         session.commit()
 
     report = scanner.scan_root(root, session_factory=factory, cancel=lambda: True)
 
     with factory() as session:
-        assert session.scalar(select(Image).where(Image.path == str(root / "gone.jpg"))) is not None
+        assert session.scalar(
+            select(Image).join(ImageLocation).where(ImageLocation.path == str(root / "gone.jpg"))
+        ) is not None
     assert report.cancelled and not report.complete
 
 
@@ -198,17 +207,19 @@ def test_catalog_browser_calendar_detail_and_counts(tmp_path):
         person = Person(name="Ada", embedding=[0.0] * 512)
         session.add_all([source, person])
         session.flush()
-        first = Image(
-            source_id=source.id,
-            path=str(first_path),
+        first = add_image(
+            session,
+            source,
+            first_path,
             content_hash="first",
             status="analysed",
             taken_at=datetime(2026, 1, 2, 10),
             face_count=1,
         )
-        second = Image(
-            source_id=source.id,
-            path=str(second_path),
+        second = add_image(
+            session,
+            source,
+            second_path,
             content_hash="second",
             status="indexed",
             taken_at=datetime(2026, 1, 2, 11),
@@ -228,6 +239,112 @@ def test_catalog_browser_calendar_detail_and_counts(tmp_path):
     assert detail is not None and detail.faces[0].person_name == "Ada"
     assert list(groups) == [datetime(2026, 1, 2).date()]
     assert counts["analysed"] == 1 and counts["indexed"] == 1
+
+
+def test_catalog_deduplicates_locations_and_keeps_offline_entries(tmp_path):
+    factory = database()
+    root = tmp_path / "images"
+    nested = root / "a"
+    other_root = tmp_path / "other"
+    nested.mkdir(parents=True)
+    (root / "z").mkdir()
+    other_root.mkdir()
+    accessible_path = root / "z" / "copy.jpg"
+    accessible_path.write_bytes(b"available")
+    offline_path = nested / "copy.jpg"
+    cached_thumbnail = tmp_path / "thumbnails" / "offline.jpg"
+    cached_thumbnail.parent.mkdir()
+    cached_thumbnail.write_bytes(b"cached thumbnail")
+    missing_path = root / "zz" / "offline.jpg"
+
+    with factory() as session:
+        source = Source(path=str(root))
+        other_source = Source(path=str(other_root))
+        person = Person(name="Ada")
+        session.add_all([source, other_source, person])
+        session.flush()
+        duplicate = add_image(
+            session,
+            source,
+            accessible_path,
+            "duplicate-hash",
+            status="analysed",
+            face_count=1,
+            taken_at=datetime(2026, 4, 5, 12),
+            gps_place="Paris",
+        )
+        session.add_all(
+            [
+                ImageLocation(
+                    image_id=duplicate.id, source_id=source.id, path=str(offline_path)
+                ),
+                ImageLocation(
+                    image_id=duplicate.id,
+                    source_id=other_source.id,
+                    path=str(other_root / "copy.jpg"),
+                ),
+            ]
+        )
+        offline = add_image(
+            session,
+            source,
+            missing_path,
+            "offline-hash",
+            thumb_path=str(cached_thumbnail),
+            status="indexed",
+            taken_at=datetime(2026, 4, 6, 12),
+            width=1200,
+            height=800,
+        )
+        session.add(Face(image_id=duplicate.id, person_id=person.id, x=1, y=2, w=3, h=4))
+        session.commit()
+        duplicate_id = duplicate.id
+        offline_id = offline.id
+        person_id = person.id
+
+    rows = catalog.list_images(root=root, session_factory=factory)
+    nested_rows = catalog.list_images(root=root, directory="a", session_factory=factory)
+    other_root_rows = catalog.list_images(root=other_root, session_factory=factory)
+    filtered_rows = catalog.list_images(
+        root=root,
+        persons=[person_id],
+        locations=["Paris"],
+        date_from=date(2026, 4, 5),
+        date_to=date(2026, 4, 5),
+        session_factory=factory,
+    )
+    calendar = catalog.calendar_groups(root=root, session_factory=factory)
+    counts = catalog.status_counts(root=root, session_factory=factory)
+    groups = catalog.list_person_groups(root=root, session_factory=factory)
+    detail = catalog.get_image_detail(duplicate_id, root=root, session_factory=factory)
+    nested_detail = catalog.get_image_detail(duplicate_id, root=nested, session_factory=factory)
+    offline_detail = catalog.get_image_detail(offline_id, root=root, session_factory=factory)
+
+    assert [row.id for row in rows] == [duplicate_id, offline_id]
+    assert len({row.id for row in rows}) == len(rows)
+    assert rows[0].path == str(accessible_path.resolve())
+    assert [row.id for row in nested_rows] == [duplicate_id]
+    assert nested_rows[0].relative_path == "a/copy.jpg"
+    assert [row.id for row in other_root_rows] == [duplicate_id]
+    assert other_root_rows[0].path == str((other_root / "copy.jpg").resolve())
+    assert [row.id for row in filtered_rows] == [duplicate_id]
+    assert [item.id for day in calendar.values() for item in day] == [duplicate_id, offline_id]
+    assert counts == {"pending": 0, "indexed": 1, "analysed": 1, "error": 0}
+    assert len(groups) == 1
+    assert groups[0].person_id == person_id
+    assert groups[0].face_count == 1 and groups[0].image_count == 1
+    assert groups[0].representative_image_path == str(accessible_path.resolve())
+    assert detail is not None and detail.path == str(accessible_path.resolve())
+    assert detail.taken_at == datetime(2026, 4, 5, 12)
+    assert detail.faces[0].person_name == "Ada"
+    assert nested_detail is not None and nested_detail.path == str(offline_path.resolve())
+    assert offline_detail is not None
+    assert offline_detail.path == str(missing_path.resolve())
+    assert offline_detail.thumb_path == str(cached_thumbnail)
+    assert (offline_detail.width, offline_detail.height) == (1200, 800)
+    assert catalog.get_image_detail(
+        path=offline_path, root=root, session_factory=factory
+    ).path == str(accessible_path.resolve())
 
 
 def test_catalog_person_groups_and_any_all_search_are_root_scoped(tmp_path):
@@ -261,9 +378,10 @@ def test_catalog_person_groups_and_any_all_search_are_root_scoped(tmp_path):
         session.flush()
         images = {}
         for label, path in paths.items():
-            images[label] = Image(
-                source_id=outside_source.id if label == "outside" else source.id,
-                path=str(path),
+            images[label] = add_image(
+                session,
+                outside_source if label == "outside" else source,
+                path,
                 content_hash=label,
                 thumb_path=f"thumbs/{label}.jpg",
                 taken_at=dates[label],
@@ -362,19 +480,17 @@ def test_analysis_target_selection_scopes_root_and_retries_explicit_errors(tmp_p
     other = tmp_path / "other"
     root.mkdir()
     other.mkdir()
+    for path in (root / "indexed.jpg", root / "error.jpg", root / "done.jpg", other / "outside.jpg"):
+        path.write_bytes(path.name.encode())
     with factory() as session:
         source = Source(path=str(root))
         other_source = Source(path=str(other))
         session.add_all([source, other_source])
         session.flush()
-        session.add_all(
-            [
-                Image(source_id=source.id, path=str(root / "indexed.jpg"), content_hash="1", status="indexed"),
-                Image(source_id=source.id, path=str(root / "error.jpg"), content_hash="2", status="error"),
-                Image(source_id=source.id, path=str(root / "done.jpg"), content_hash="3", status="analysed"),
-                Image(source_id=other_source.id, path=str(other / "outside.jpg"), content_hash="4", status="indexed"),
-            ]
-        )
+        add_image(session, source, root / "indexed.jpg", "1", status="indexed")
+        add_image(session, source, root / "error.jpg", "2", status="error")
+        add_image(session, source, root / "done.jpg", "3", status="analysed")
+        add_image(session, other_source, other / "outside.jpg", "4", status="indexed")
         session.commit()
 
     targets = analyser.select_analysis_targets(root=root, session_factory=factory)
@@ -395,13 +511,14 @@ def test_cluster_rebuild_keeps_named_person(tmp_path, monkeypatch):
         session.add(source)
         session.flush()
         for index in range(2):
-            session.add(
-                Image(
-                    source_id=source.id,
-                    path=str(root / f"photo-{index}.jpg"),
-                    content_hash=str(index),
-                    status="indexed",
-                )
+            path = root / f"photo-{index}.jpg"
+            path.write_bytes(str(index).encode())
+            add_image(
+                session,
+                source,
+                path,
+                scanner.sha256_file(path),
+                status="indexed",
             )
         session.commit()
     embedding = [1.0] + [0.0] * 511
@@ -415,7 +532,9 @@ def test_cluster_rebuild_keeps_named_person(tmp_path, monkeypatch):
         person = session.scalar(select(Person))
         person.name = "Ada"
         person_id = person.id
-        image = session.scalar(select(Image).where(Image.path.like("%photo-0.jpg")))
+        image = session.scalar(
+            select(Image).join(ImageLocation).where(ImageLocation.path.like("%photo-0.jpg"))
+        )
         image.status = "indexed"
         session.commit()
 
@@ -435,9 +554,10 @@ def test_process_worker_response_persists_atomically_and_rejects_stale_hash(tmp_
         source = Source(path=str(tmp_path))
         session.add(source)
         session.flush()
-        image = Image(
-            source_id=source.id,
-            path=str(image_path),
+        image = add_image(
+            session,
+            source,
+            image_path,
             content_hash=content_hash,
             status="indexed",
         )
@@ -478,6 +598,50 @@ def test_process_worker_response_persists_atomically_and_rejects_stale_hash(tmp_
     assert not stale.accepted and stale.status == "stale"
 
 
+def test_worker_response_is_stale_if_selected_location_was_removed(tmp_path):
+    factory = database()
+    root = tmp_path / "images"
+    root.mkdir()
+    first_path = root / "first.jpg"
+    second_path = root / "copy.jpg"
+    first_path.write_bytes(b"same bytes")
+    second_path.write_bytes(first_path.read_bytes())
+    content_hash = scanner.sha256_file(first_path)
+    with factory() as session:
+        source = Source(path=str(root))
+        session.add(source)
+        session.flush()
+        image = add_image(session, source, first_path, content_hash, status="indexed")
+        session.add(
+            ImageLocation(image_id=image.id, source_id=source.id, path=str(second_path))
+        )
+        session.commit()
+        image_id = image.id
+
+    target = analyser.select_analysis_targets(root=root, session_factory=factory)[0]
+    with factory() as session:
+        location = session.scalar(
+            select(ImageLocation).where(ImageLocation.path == target.path)
+        )
+        session.delete(location)
+        session.commit()
+
+    stale = analyser.persist_worker_response(
+        target.id,
+        [],
+        expected_content_hash=target.content_hash,
+        expected_path=target.path,
+        session_factory=factory,
+    )
+
+    with factory() as session:
+        image = session.get(Image, image_id)
+        assert image.status == "indexed"
+        assert image.face_count == 0
+        assert session.scalar(select(Face).where(Face.image_id == image_id)) is None
+    assert not stale.accepted and stale.status == "stale"
+
+
 def test_process_batch_rebuild_api_uses_fake_faces_without_deepface(tmp_path, capsys):
     factory = database()
     embedding = [1.0] + [0.0] * 511
@@ -489,9 +653,10 @@ def test_process_batch_rebuild_api_uses_fake_faces_without_deepface(tmp_path, ca
             path = tmp_path / f"photo-{index}.jpg"
             path.write_bytes(str(index).encode())
             session.add(
-                Image(
-                    source_id=source.id,
-                    path=str(path),
+                add_image(
+                    session,
+                    source,
+                    path,
                     content_hash=scanner.sha256_file(path),
                     status="indexed",
                 )

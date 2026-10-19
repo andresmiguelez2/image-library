@@ -7,7 +7,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from imagelib.db.maintenance import reconcile_persons
-from imagelib.db.models import Base, Face, FaceMatchDecision, Image, Person, Source
+from imagelib.db.models import Base, Face, FaceMatchDecision, Image, ImageLocation, Person, Source
 from imagelib.services import analyser, catalog
 
 
@@ -35,14 +35,15 @@ def _add_group(factory, root: Path, name: str, angle: float, count: int = 2) -> 
             path = root / f"{name}-{index}.jpg"
             path.parent.mkdir(parents=True, exist_ok=True)
             image = Image(
-                source_id=source.id,
-                path=str(path),
                 content_hash=f"{name}-{index}",
                 status="analysed",
                 face_count=1,
             )
             session.add(image)
             session.flush()
+            session.add(
+                ImageLocation(image_id=image.id, source_id=source.id, path=str(path))
+            )
             offset = (index - (count - 1) / 2) * 0.3
             face = Face(
                 image_id=image.id,
@@ -235,14 +236,19 @@ def test_reconcile_preserves_named_person_referenced_by_durable_decision(tmp_pat
         session.add_all([source, target])
         session.flush()
         image = Image(
-            source_id=source.id,
-            path=str(root / "candidate.jpg"),
             content_hash="candidate",
             status="analysed",
             face_count=1,
         )
         session.add(image)
         session.flush()
+        session.add(
+            ImageLocation(
+                image_id=image.id,
+                source_id=source.id,
+                path=str(root / "candidate.jpg"),
+            )
+        )
         face = Face(image_id=image.id, x=0, y=0, w=2, h=2, embedding=_vector(30))
         session.add(face)
         session.flush()
@@ -274,14 +280,19 @@ def test_face_replacement_clears_person_cover_reference(tmp_path):
         session.add(source)
         session.flush()
         image = Image(
-            source_id=source.id,
-            path=str(root / "photo.jpg"),
             content_hash="photo",
             status="analysed",
             face_count=1,
         )
         session.add(image)
         session.flush()
+        session.add(
+            ImageLocation(
+                image_id=image.id,
+                source_id=source.id,
+                path=str(root / "photo.jpg"),
+            )
+        )
         face = Face(image_id=image.id, x=0, y=0, w=2, h=2, embedding=_vector(0))
         session.add(face)
         session.flush()
@@ -296,6 +307,46 @@ def test_face_replacement_clears_person_cover_reference(tmp_path):
         session.commit()
         assert session.get(Face, face.id) is None
         assert session.get(Person, person_id).cover_face_id is None
+
+
+def test_group_label_survives_an_additional_location(tmp_path, monkeypatch):
+    factory, root = _setup(tmp_path, monkeypatch)
+    face_ids = _add_group(factory, root, "same-content", 0)
+    analyser.rebuild_person_clusters(session_factory=factory)
+    outside = tmp_path / "another-root"
+    outside.mkdir()
+    with factory() as session:
+        face = session.get(Face, face_ids[0])
+        image = session.get(Image, face.image_id)
+        source = Source(path=str(outside))
+        session.add(source)
+        session.flush()
+        session.add(
+            ImageLocation(
+                image_id=image.id,
+                source_id=source.id,
+                path=str(outside / "copy.jpg"),
+            )
+        )
+        session.commit()
+
+    labelled = analyser.label_face_group(
+        face_ids[0], "Ada", root=root, session_factory=factory
+    )
+    analyser.rebuild_person_clusters(session_factory=factory)
+
+    assert _faces_person_ids(factory, face_ids) == [labelled.person_id] * len(face_ids)
+    with factory() as session:
+        decisions = list(
+            session.scalars(
+                select(FaceMatchDecision).where(
+                    FaceMatchDecision.face_id.in_(face_ids),
+                    FaceMatchDecision.target_person_id == labelled.person_id,
+                )
+            )
+        )
+        assert len(decisions) == len(face_ids)
+        assert {decision.status for decision in decisions} == {"accepted"}
 
 
 def test_proposal_catalog_and_mutations_are_root_scoped(tmp_path, monkeypatch):

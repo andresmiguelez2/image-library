@@ -19,7 +19,7 @@ from sqlalchemy import delete, select, update
 
 from imagelib.config import active_root, thumbnail_directory, watched_directories
 from imagelib.db.maintenance import reconcile_persons
-from imagelib.db.models import Face, Image, Person, Source
+from imagelib.db.models import Face, FaceMatchDecision, Image, ImageLocation, Person, Source
 from imagelib.db.session import SessionLocal
 
 SUPPORTED_SUFFIXES = {".png", ".jpg", ".jpeg"}
@@ -167,14 +167,19 @@ def _remove_faces(session, image_id: int) -> None:
             .where(Person.cover_face_id.in_(face_ids))
             .values(cover_face_id=None)
         )
+        session.execute(delete(FaceMatchDecision).where(FaceMatchDecision.face_id.in_(face_ids)))
     session.execute(delete(Face).where(Face.image_id == image_id))
 
 
-def _source_path(path: Path) -> Path:
+def _source_path(path: Path, fallback_root: Path | None = None) -> Path:
     """Return the deepest configured watched root containing ``path``."""
-    roots = watched_directories()
+    roots = [Path(root).expanduser().resolve() for root in watched_directories()]
     matching = [root for root in roots if _under(path, root)]
-    return max(matching, key=lambda value: len(value.parts)) if matching else path.parent
+    if matching:
+        return max(matching, key=lambda value: len(value.parts))
+    if fallback_root is not None:
+        return Path(fallback_root).expanduser().resolve()
+    return path.parent
 
 
 def _cancelled(cancel: Callable[[], bool] | object | None) -> bool:
@@ -206,26 +211,38 @@ def _safe_remove_thumbnail(path: str | None, protected_roots: Iterable[Path] = (
 
 
 def _reconcile(session, root: Path, found: set[str]) -> tuple[int, list[str]]:
-    stale = []
-    for image in session.scalars(select(Image)):
-        image_path = Path(image.path)
-        if _under(image_path, root) and str(image_path.resolve()) not in found:
-            stale.append(image)
+    stale_locations = []
+    for location in session.scalars(select(ImageLocation)):
+        path = Path(location.path)
+        if _under(path, root) and str(path.resolve()) not in found:
+            stale_locations.append(location)
     thumbnails: list[str] = []
-    for image in stale:
+    affected_image_ids = {location.image_id for location in stale_locations}
+    for location in stale_locations:
+        session.delete(location)
+    session.flush()
+
+    removed_images = []
+    for image_id in affected_image_ids:
+        image = session.get(Image, image_id)
+        if image is None or session.scalar(
+            select(ImageLocation.id).where(ImageLocation.image_id == image_id).limit(1)
+        ) is not None:
+            continue
         if image.thumb_path:
             thumbnails.append(image.thumb_path)
         _remove_faces(session, image.id)
         session.delete(image)
+        removed_images.append(image)
     session.flush()
-    if stale:
+    if removed_images:
         reconcile_persons(session)
     session.commit()
     for thumbnail in set(thumbnails):
         still_used = session.scalar(select(Image.id).where(Image.thumb_path == thumbnail))
         if still_used is None:
             _safe_remove_thumbnail(thumbnail, [root, *watched_directories()])
-    return len(stale), thumbnails
+    return len(removed_images), thumbnails
 
 
 def scan_root(
@@ -259,6 +276,8 @@ def scan_root(
     report.discovered = len(paths)
     found = {str(path.resolve()) for path in paths}
     with session_factory() as session:
+        removed_image_ids: set[int] = set()
+        removed_thumbnails: set[str] = set()
         for path in paths:
             if _cancelled(cancel):
                 report.cancelled = True
@@ -268,57 +287,130 @@ def scan_root(
                 progress(path)
             content_hash = ""
             try:
+                source = _source(session, _source_path(path, selected_root))
                 content_hash = sha256_file(path)
-                existing = session.scalar(select(Image).where(Image.path == str(path)))
-                if existing is not None and existing.content_hash == content_hash:
+                path_string = str(path.resolve())
+                location = session.scalar(
+                    select(ImageLocation).where(ImageLocation.path == path_string)
+                )
+                previous_image_id = location.image_id if location is not None else None
+                if (
+                    location is not None
+                    and location.image.content_hash == content_hash
+                ):
+                    location.source = source
                     report.unchanged += 1
+                    session.commit()
                     continue
-                source = _source(session, selected_root)
-                if existing is None:
-                    existing = Image(path=str(path), source=source, content_hash=content_hash)
-                    session.add(existing)
+
+                image = session.scalar(
+                    select(Image).where(Image.content_hash == content_hash)
+                )
+                is_new_image = image is None
+                if image is None:
+                    metadata = _metadata(path)
+                    thumb = thumbnail_path_for(path, content_hash)
+                    _write_thumbnail(path, thumb)
+                    image = Image(
+                        content_hash=content_hash,
+                        size_bytes=path.stat().st_size,
+                        modified_at=datetime.fromtimestamp(path.stat().st_mtime),
+                        thumb_path=str(thumb),
+                        status="indexed",
+                    )
+                    for key, value in metadata.items():
+                        setattr(image, key, value)
+                    session.add(image)
                     session.flush()
+
+                if location is None:
+                    location = ImageLocation(
+                        image_id=image.id,
+                        source=source,
+                        path=path_string,
+                    )
+                    session.add(location)
                 else:
-                    existing.source = source
-                    existing.content_hash = content_hash
-                    _remove_faces(session, existing.id)
-                metadata = _metadata(path)
-                thumb = thumbnail_path_for(path, content_hash)
-                _write_thumbnail(path, thumb)
-                for key, value in metadata.items():
-                    setattr(existing, key, value)
-                existing.size_bytes = path.stat().st_size
-                existing.modified_at = datetime.fromtimestamp(path.stat().st_mtime)
-                existing.thumb_path = str(thumb)
-                existing.face_count = 0
-                existing.status = "indexed"
-                existing.error = None
+                    location.image = image
+                    location.source = source
+
+                session.flush()
+                if previous_image_id is not None and previous_image_id != image.id:
+                    previous_image = session.get(Image, previous_image_id)
+                    if previous_image is not None and session.scalar(
+                        select(ImageLocation.id)
+                        .where(ImageLocation.image_id == previous_image_id)
+                        .limit(1)
+                    ) is None:
+                        if previous_image.thumb_path:
+                            removed_thumbnails.add(previous_image.thumb_path)
+                        _remove_faces(session, previous_image.id)
+                        session.delete(previous_image)
+                        removed_image_ids.add(previous_image_id)
                 session.commit()
-                report.indexed += 1
+                if is_new_image:
+                    report.indexed += 1
+                else:
+                    report.unchanged += 1
             except Exception as exc:
                 session.rollback()
-                try:
-                    source = _source(session, selected_root)
-                    existing = session.scalar(select(Image).where(Image.path == str(path)))
-                    if existing is None:
-                        existing = Image(
-                            path=str(path),
-                            source=source,
-                            content_hash=content_hash or "unavailable",
+                if content_hash:
+                    try:
+                        source = _source(session, _source_path(path, selected_root))
+                        path_string = str(path.resolve())
+                        location = session.scalar(
+                            select(ImageLocation).where(ImageLocation.path == path_string)
                         )
-                        session.add(existing)
+                        previous_image_id = location.image_id if location is not None else None
+                        image = session.scalar(
+                            select(Image).where(Image.content_hash == content_hash)
+                        )
+                        if image is None:
+                            image = Image(
+                                content_hash=content_hash,
+                                size_bytes=path.stat().st_size,
+                                modified_at=datetime.fromtimestamp(path.stat().st_mtime),
+                                status="error",
+                                error=f"{type(exc).__name__}: {exc}"[:4000],
+                            )
+                            session.add(image)
+                            session.flush()
+                        if location is None:
+                            session.add(
+                                ImageLocation(
+                                    image_id=image.id,
+                                    source=source,
+                                    path=path_string,
+                                )
+                            )
+                        else:
+                            location.image = image
+                            location.source = source
                         session.flush()
-                    else:
-                        existing.content_hash = content_hash or existing.content_hash
-                        _remove_faces(session, existing.id)
-                    existing.status = "error"
-                    existing.face_count = 0
-                    existing.error = f"{type(exc).__name__}: {exc}"[:4000]
-                    session.commit()
-                except Exception:
-                    session.rollback()
+                        if previous_image_id is not None and previous_image_id != image.id:
+                            previous_image = session.get(Image, previous_image_id)
+                            if previous_image is not None and session.scalar(
+                                select(ImageLocation.id)
+                                .where(ImageLocation.image_id == previous_image_id)
+                                .limit(1)
+                            ) is None:
+                                if previous_image.thumb_path:
+                                    removed_thumbnails.add(previous_image.thumb_path)
+                                _remove_faces(session, previous_image.id)
+                                session.delete(previous_image)
+                                removed_image_ids.add(previous_image_id)
+                        session.commit()
+                    except Exception:
+                        session.rollback()
                 report.errors += 1
 
+        if removed_image_ids:
+            reconcile_persons(session)
+            session.commit()
+        for thumbnail in removed_thumbnails:
+            still_used = session.scalar(select(Image.id).where(Image.thumb_path == thumbnail))
+            if still_used is None:
+                _safe_remove_thumbnail(thumbnail, [selected_root, *watched_directories()])
         if _cancelled(cancel):
             report.cancelled = True
         report.complete = discovery_complete and not report.cancelled and report.errors == 0

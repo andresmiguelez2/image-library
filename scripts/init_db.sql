@@ -14,8 +14,6 @@ CREATE TABLE IF NOT EXISTS sources (
 
 CREATE TABLE IF NOT EXISTS images (
     id            SERIAL PRIMARY KEY,
-    source_id     INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
-    path          TEXT NOT NULL UNIQUE,
     content_hash  TEXT NOT NULL,
     size_bytes    BIGINT,
     width         INTEGER,
@@ -33,8 +31,20 @@ CREATE TABLE IF NOT EXISTS images (
                   CHECK (status IN ('pending', 'indexed', 'analysed', 'error')),
     error         TEXT,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_images_content_hash UNIQUE (content_hash)
 );
+
+CREATE TABLE IF NOT EXISTS image_locations (
+    id         SERIAL PRIMARY KEY,
+    image_id   INTEGER NOT NULL REFERENCES images(id) ON DELETE CASCADE,
+    source_id  INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    path       TEXT NOT NULL,
+    CONSTRAINT uq_image_locations_path UNIQUE (path)
+);
+
+CREATE INDEX IF NOT EXISTS ix_image_locations_image_id ON image_locations (image_id);
+CREATE INDEX IF NOT EXISTS ix_image_locations_source_id ON image_locations (source_id);
 
 CREATE TABLE IF NOT EXISTS persons (
     id           SERIAL PRIMARY KEY,
