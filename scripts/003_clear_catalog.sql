@@ -44,8 +44,8 @@ BEGIN
     END IF;
 
     DELETE FROM public.face_match_decisions;
-    DELETE FROM public.faces;
     DELETE FROM public.persons;
+    DELETE FROM public.faces;
     DELETE FROM public.images;
     DELETE FROM public.sources;
 

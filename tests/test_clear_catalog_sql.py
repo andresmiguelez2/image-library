@@ -29,8 +29,16 @@ def test_clear_function_is_explicit_safe_and_handles_optional_location_table():
     assert "TO_REGCLASS(FORMAT('PUBLIC.%I', REQUIRED_TABLE)) IS NULL" in upper_definition
     assert "RAISE EXCEPTION" in upper_definition
     assert "DELETE FROM PUBLIC.IMAGE_LOCATIONS" in upper_definition
-    for table in ("face_match_decisions", "faces", "persons", "images", "sources"):
-        assert f"DELETE FROM PUBLIC.{table.upper()}" in upper_definition
+    delete_order = (
+        "DELETE FROM PUBLIC.IMAGE_LOCATIONS",
+        "DELETE FROM PUBLIC.FACE_MATCH_DECISIONS",
+        "DELETE FROM PUBLIC.PERSONS",
+        "DELETE FROM PUBLIC.FACES",
+        "DELETE FROM PUBLIC.IMAGES",
+        "DELETE FROM PUBLIC.SOURCES",
+    )
+    delete_positions = [upper_definition.index(statement) for statement in delete_order]
+    assert delete_positions == sorted(delete_positions)
     assert "ALTER SEQUENCE" in upper_definition
     assert "TRUNCATE" not in upper_definition
     assert "CASCADE" not in upper_definition

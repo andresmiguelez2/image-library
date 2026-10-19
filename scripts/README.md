@@ -17,10 +17,13 @@ Fresh databases receive the same function definition from `init_db.sql`.
 `clear_catalog()` is destructive and must only be invoked deliberately with
 `SELECT public.clear_catalog();`. It deletes rows from `sources`, `images`,
 `faces`, `persons`, and `face_match_decisions`, plus `image_locations` when that
-table exists, and restarts their serial/identity sequences. It stops with an
-error if any required table is missing. The function uses invoker privileges
-and does not cascade into other tables. It never deletes original image files
-or the thumbnail cache; it only removes catalogue rows and their stored paths.
+table exists. Deletion order is decisions, persons, faces, images, then sources;
+`image_locations` is deleted first when present. Persons are removed before
+faces to respect the person cover-face reference. It restarts the affected
+serial/identity sequences and stops with an error if any required table is
+missing. The function uses invoker privileges and does not cascade into other
+tables. It never deletes original image files or the thumbnail cache; it only
+removes catalogue rows and their stored paths.
 
 The migration adds the unique constraint on non-NULL person names and the
 `face_match_decisions` table. It checks for duplicate labels before changing
